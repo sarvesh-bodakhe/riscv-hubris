@@ -132,12 +132,16 @@ pub(crate) fn event_syscall_exit() {
     }
 }
 
+// The secondary syscall is arm_m's PendSV. A backend that switches tasks
+// directly from its trap handler has none, and no caller for these two.
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 pub(crate) fn event_secondary_syscall_enter() {
     if let Some(t) = table() {
         (t.secondary_syscall_enter)()
     }
 }
 
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 pub(crate) fn event_secondary_syscall_exit() {
     if let Some(t) = table() {
         (t.secondary_syscall_exit)()
