@@ -4,6 +4,6 @@
 # strips local paths from panic messages, because they're bad for both
 # reproducibility and binary size.
 channel = "1.95.0"
-targets = [ "thumbv6m-none-eabi", "thumbv7em-none-eabihf", "thumbv8m.main-none-eabihf" ]
+targets = [ "thumbv6m-none-eabi", "thumbv7em-none-eabihf", "thumbv8m.main-none-eabihf", "riscv32imac-unknown-none-elf" ]
 profile = "minimal"
 components = [ "clippy", "rustfmt", "rust-analyzer" ]

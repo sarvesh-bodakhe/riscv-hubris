@@ -76,6 +76,10 @@ pub fn expose_m_profile() -> Result<()> {
         println!("cargo::rustc-cfg=armv7m");
     } else if target.starts_with("thumbv8m") {
         println!("cargo::rustc-cfg=armv8m");
+    } else if target.starts_with("riscv32") {
+        // Not an M-profile target; no cfg to expose. The check-cfg
+        // declarations above still apply, so cfg(armv*m) tests in shared
+        // code remain valid (and false) on this target.
     } else {
         bail!("Don't know the target {target}");
     }

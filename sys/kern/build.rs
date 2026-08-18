@@ -258,6 +258,11 @@ fn process_config() -> Result<Generated> {
     } else if target.starts_with("thumbv7m")
         || target.starts_with("thumbv7em")
         || target.starts_with("thumbv8m")
+        // The "im" prefix is deliberate: the perfect hash lookup for fired
+        // IRQ O(1) needs hardware division support, which on RISC-V is the
+        // M extension. A plain rv32i target should pick the sorted-list
+        // fallback above, like ARMv6-M.
+        || target.starts_with("riscv32im")
     {
         // First, try to build it as a single-level perfect hash map, which is
         // cheaper but won't always succeed.

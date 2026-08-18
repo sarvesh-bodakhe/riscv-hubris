@@ -49,10 +49,49 @@
 //! callee-saved on ARM, which mattered there for exception-frame reasons that
 //! do not apply to us.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::atomic::AtomicExt;
 use crate::descs::RegionAttributes;
 use crate::task;
 use crate::time::Timestamp;
 use abi::{InterruptNum, UsageError};
+
+// The kernel requires an atomic swap operation, abstracted behind
+// `crate::atomic::AtomicExt` because not every supported CPU has one in
+// hardware: ARMv6-M doesn't, and its arch module substitutes an
+// interrupt-masking load/store pair (a "polyfill").
+//
+// On RISC-V, atomic read-modify-write instructions come from the "A"
+// (atomic) ISA extension. When it is present, Rust's native
+// `AtomicBool::swap` compiles to a single `amoswap` instruction and the
+// polyfill below is just a direct call to it. When it is absent, libcore
+// does not offer `swap` at all, and this module would need an
+// ARMv6-M-style interrupt-masking implementation instead.
+//
+// The kernel builds for the `riscv32imac` target, so A is available.
+cfg_if::cfg_if! {
+    if #[cfg(target_feature = "a")] {
+        impl AtomicExt for AtomicBool {
+            type Primitive = bool;
+
+            #[inline(always)]
+            fn swap_polyfill(
+                &self,
+                value: Self::Primitive,
+                ordering: Ordering,
+            ) -> Self::Primitive {
+                self.swap(value, ordering)
+            }
+        }
+    } else {
+        compile_error!(
+            "this RISC-V target lacks the A (atomic) extension; \
+             AtomicExt needs an interrupt-masking polyfill here, \
+             like the ARMv6-M one in arch/arm_m.rs"
+        );
+    }
+}
 
 /// Assertion macro used by portable kernel code (`umem.rs`) as well as by the
 /// arch modules.
