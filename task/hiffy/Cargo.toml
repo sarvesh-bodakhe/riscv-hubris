@@ -22,13 +22,18 @@ test-api = { path = "../../test/test-api", optional = true}
 
 byteorder.workspace = true
 cfg-if.workspace = true
-cortex-m.workspace = true
 hif.workspace = true
 idol-runtime.workspace = true
 num-traits.workspace = true
 serde.workspace = true
 zerocopy.workspace = true
 zerocopy-derive.workspace = true
+
+# Nothing in this task uses it directly, but it stays a dependency of
+# the ARM builds it has always been part of; the RISC-V targets cannot
+# compile it.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m.workspace = true
 
 [build-dependencies]
 build-util = { path = "../../build/util" }

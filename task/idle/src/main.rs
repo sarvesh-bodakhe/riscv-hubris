@@ -24,7 +24,7 @@ fn main() -> ! {
         //
         // Wait For Interrupt to pause the processor until an ISR arrives,
         // which could wake some higher-priority task.
-        #[cfg(not(feature = "insomniac"))]
+        #[cfg(all(not(feature = "insomniac"), target_arch = "arm"))]
         cortex_m::asm::wfi();
     }
 }
