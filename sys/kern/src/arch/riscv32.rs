@@ -6,12 +6,12 @@
 //!
 //! # Status
 //!
-//! This is a **skeleton**. It defines every name the portable kernel expects
-//! from `arch::`, so that the kernel compiles for a `riscv32` target, but the
-//! bodies are unimplemented. Nothing here has run on hardware.
-//!
-//! The intent is to establish the seam as a separate, reviewable step from
-//! filling it in.
+//! The context-switch core is implemented: trap entry/exit via `mscratch`,
+//! syscall dispatch, fault delivery, task (re)initialization, and PMP
+//! programming. Still unimplemented (`todo!`): the kernel tick, interrupt
+//! control, software IRQ pending, and reset -- all of which depend on
+//! implementation-chosen hardware rather than on the ISA. **Nothing here
+//! has run on hardware.**
 //!
 //! # How this differs from `arm_m`
 //!
@@ -26,8 +26,8 @@
 //! 2. **A scratch register exists.** `arm_m` keeps the current task pointer in
 //!    a global (`CURRENT_TASK_PTR`) because it has no register to spare on
 //!    exception entry. RISC-V has `mscratch` for exactly this purpose. We still
-//!    keep a global for now, for parity and for debugger visibility, but the
-//!    trap handler will use `mscratch`.
+//!    keep a global, for parity and for debugger visibility, but the trap
+//!    handler uses `mscratch`.
 //!
 //! 3. **PMP, not MPU.** Regions are described by `pmpaddr`/`pmpcfg` pairs and
 //!    encoded NAPOT (naturally-aligned power of two) rather than by an
@@ -49,13 +49,17 @@
 //! callee-saved on ARM, which mattered there for exception-frame reasons that
 //! do not apply to us.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::atomic::AtomicExt;
 use crate::descs::RegionAttributes;
+use crate::startup::with_task_table;
 use crate::task;
 use crate::time::Timestamp;
-use abi::{InterruptNum, UsageError};
+use crate::umem::USlice;
+use abi::{FaultInfo, FaultSource, InterruptNum, UsageError};
+use unwrap_lite::UnwrapLite;
 
 // The kernel requires an atomic swap operation, abstracted behind
 // `crate::atomic::AtomicExt` because not every supported CPU has one in
@@ -105,6 +109,22 @@ macro_rules! uassert {
             panic!("Assertion failed!");
         }
     };
+}
+
+/// Reads a CSR by name, e.g. `read_csr!("mcause")`.
+macro_rules! read_csr {
+    ($name:literal) => {{
+        let value: u32;
+        // Safety: reading these M-mode status CSRs has no side effects.
+        unsafe {
+            core::arch::asm!(
+                concat!("csrr {}, ", $name),
+                out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        value
+    }};
 }
 
 /// RISC-V integer registers that must be saved across a context switch.
@@ -260,65 +280,473 @@ pub struct RegionDescExt {
 
 /// Precomputes the PMP register values for a region, at compile time.
 ///
-/// TODO: unimplemented. Returns a deny-all placeholder.
-///
 /// This must stay a `const fn`: the build system generates a static task table
 /// containing the results, so this is evaluated by the compiler, not at run
-/// time. That also means it cannot panic on bad input in the final version
-/// without failing the build -- which is, in fact, the desired behaviour for a
-/// misaligned region.
+/// time. A `panic!` here is therefore a *build* failure, which is exactly what
+/// we want for a region the PMP cannot represent.
 ///
-/// The real implementation encodes NAPOT: for a region of size `2^n` at a
-/// naturally aligned base, `pmpaddr = (base >> 2) | ((1 << (n - 3)) - 1)`, with
-/// `pmpcfg.A = NAPOT`. The smallest region the PMP expresses is its
-/// granularity, `2^(G+2)` bytes, which the privileged spec leaves to the
-/// implementation.
+/// Encoding is NAPOT (naturally-aligned power of two): for a region of size
+/// `2^n` at a naturally aligned base, `pmpaddr = (base >> 2) | ((size >> 3) -
+/// 1)` and `pmpcfg.A = NAPOT`. See the PMP chapter of the privileged spec.
+///
+/// PMP granularity is implementation-chosen; this encoder assumes 128
+/// bytes, the same placeholder the build system sizes regions to
+/// (build/xtask/src/config.rs `mpu_alignment`). For a NAPOT region smaller
+/// than the granularity, the hardwired low `pmpaddr` bits silently grow it
+/// to the granularity. That is fine for a region granting *no* access (the
+/// 32-byte null region -- growing a deny region denies more, and U-mode has
+/// no default access anyway), but would be a silent protection hole for any
+/// region granting access, so we reject those.
 pub const fn compute_region_extension_data(
-    _base: u32,
-    _size: u32,
-    _attributes: RegionAttributes,
+    base: u32,
+    size: u32,
+    attributes: RegionAttributes,
 ) -> RegionDescExt {
-    RegionDescExt {
-        pmpaddr: 0,
-        pmpcfg: 0,
+    const GRANULARITY: u32 = 128; // see above
+
+    if size < 8 || !size.is_power_of_two() {
+        panic!("PMP regions must be power-of-two sized, >= 8 bytes");
     }
+    if base % size != 0 {
+        panic!("PMP NAPOT regions must be naturally aligned");
+    }
+
+    let r = attributes.contains(RegionAttributes::READ);
+    let w = attributes.contains(RegionAttributes::WRITE);
+    let x = attributes.contains(RegionAttributes::EXECUTE);
+
+    if size < GRANULARITY && (r || w || x) {
+        panic!("region smaller than PMP granularity grants access");
+    }
+    // The R=0, W=1 combination is reserved by the PMP spec (absent Smepmp
+    // rules we don't use).
+    if w && !r {
+        panic!("PMP cannot express write-without-read");
+    }
+
+    // DEVICE and DMA select memory type and cache attributes on the ARM
+    // MPU. The PMP has no equivalent, and neither role grants access, so
+    // both are ignored here.
+
+    let pmpaddr = (base >> 2) | ((size >> 3) - 1);
+    let mut pmpcfg: u32 = 0b11 << 3; // A = NAPOT, L = 0 (never locked)
+    if r {
+        pmpcfg |= 1 << 0;
+    }
+    if w {
+        pmpcfg |= 1 << 1;
+    }
+    if x {
+        pmpcfg |= 1 << 2;
+    }
+
+    RegionDescExt { pmpaddr, pmpcfg }
 }
 
 /// Reprograms the PMP for `task`, called on every context switch.
 ///
-/// TODO: unimplemented.
-///
-/// Note for the implementation: PMP entries are checked in priority order,
-/// lowest index first, and an access that matches only some of its bytes
-/// against an entry fails outright (privileged spec, PMP chapter). Region
-/// layout has to respect that for accesses that straddle a boundary.
-pub fn apply_memory_protection(_task: &task::Task) {
-    todo!("PMP programming")
+/// All eight of a task's regions map to PMP entries 0-7, precomputed at
+/// build time (see [`compute_region_extension_data`]). Entries are never
+/// locked (L=0), and unlocked PMP entries do not apply to M-mode at all --
+/// so the kernel is unaffected by whatever is programmed here, and no
+/// enable/disable dance is needed around the update. U-mode is not running
+/// while we're in here, so transient states are unobservable.
+pub fn apply_memory_protection(task: &task::Task) {
+    let mut pmpcfg = [0u32; 2];
+    let mut pmpaddr = [0u32; 8];
+    for (i, region) in task.region_table().iter().enumerate() {
+        let ext = &region.arch_data;
+        pmpaddr[i] = ext.pmpaddr;
+        pmpcfg[i / 4] |= (ext.pmpcfg & 0xFF) << ((i % 4) * 8);
+    }
+
+    // Safety: writing unlocked PMP entries has no effect on M-mode
+    // execution; the worst a bad value can do is deny or grant U-mode
+    // access, which is a correctness bug, not a memory-safety violation in
+    // the kernel.
+    unsafe {
+        core::arch::asm!("
+            csrw pmpaddr0, {addr0}
+            csrw pmpaddr1, {addr1}
+            csrw pmpaddr2, {addr2}
+            csrw pmpaddr3, {addr3}
+            csrw pmpaddr4, {addr4}
+            csrw pmpaddr5, {addr5}
+            csrw pmpaddr6, {addr6}
+            csrw pmpaddr7, {addr7}
+            csrw pmpcfg0, {cfg0}
+            csrw pmpcfg1, {cfg1}
+            ",
+            addr0 = in(reg) pmpaddr[0],
+            addr1 = in(reg) pmpaddr[1],
+            addr2 = in(reg) pmpaddr[2],
+            addr3 = in(reg) pmpaddr[3],
+            addr4 = in(reg) pmpaddr[4],
+            addr5 = in(reg) pmpaddr[5],
+            addr6 = in(reg) pmpaddr[6],
+            addr7 = in(reg) pmpaddr[7],
+            cfg0 = in(reg) pmpcfg[0],
+            cfg1 = in(reg) pmpcfg[1],
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 /// Resets a task's saved state so it will start from its entry point.
 ///
-/// TODO: unimplemented.
-pub fn reinitialize(_task: &mut task::Task) {
-    todo!("task reinitialization")
+/// Much simpler than the ARM version: RISC-V has no hardware exception
+/// frame, so there is nothing to fabricate on the task stack -- the entire
+/// initial state lives in `SavedState` and is applied by the trap-return
+/// path.
+pub fn reinitialize(task: &mut task::Task) {
+    *task.save_mut() = SavedState::default();
+    let initial_stack = task.descriptor().initial_stack;
+
+    // The RISC-V psABI requires 16-byte stack alignment at call boundaries.
+    uassert!(initial_stack & 0xF == 0);
+
+    task.save_mut().pc = task.descriptor().entry_point;
+    task.save_mut().sp = initial_stack;
+
+    // Paint the stack with a distinct pattern, for the benefit of stack
+    // usage measurement (humility stackmargin); same value as arm_m. Start
+    // from the region holding the stack's top word -- one word below the
+    // initial stack pointer; a zero stack pointer saturates to an address
+    // in no region, which skips the paint -- and paint from its base up to
+    // the stack pointer. There is no exception frame to leave room for.
+    if let Some((index, mut region)) = task
+        .region_table()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, r)| r.contains((initial_stack as usize).saturating_sub(4)))
+    {
+        // The stack may span several contiguous regions (the build chunks
+        // a non-power-of-two allocation); walk back through the sorted
+        // table to the first one.
+        let mut okay = true;
+        for prev in task.region_table()[..index].iter().rev() {
+            // A descriptor that overflows a u32 means a corrupt table.
+            let Some(prev_end) = prev.base.checked_add(prev.size) else {
+                okay = false;
+                break;
+            };
+            if prev_end != region.base {
+                break;
+            }
+            region = *prev;
+        }
+
+        // This is a diagnostic: if the slice does not fit, skip the paint
+        // rather than take the system down.
+        if okay
+            && let Some(len) =
+                (initial_stack as usize).checked_sub(region.base as usize)
+            && let Ok(mut uslice) =
+                USlice::<u32>::from_raw(region.base as usize, len >> 2)
+        {
+            // Unwrap rather than tolerate failure: try_write failing would
+            // mean the task's stack isn't writable by the task, which would
+            // bite us later anyway.
+            let zap = task.try_write(&mut uslice).unwrap_lite();
+            for word in zap.iter_mut() {
+                *word = 0xbaddcafe;
+            }
+        }
+    }
 }
 
-/// Starts the kernel tick and drops into the first task. Never returns.
+/// Starts the first task. Never returns.
 ///
-/// TODO: unimplemented.
-pub fn start_first_task(_tick_divisor: u32, _task: &task::Task) -> ! {
-    todo!("first task entry")
+/// TODO: the kernel tick is not started here yet. The privileged spec
+/// mandates no timer, so the tick source is the implementation's choice
+/// (see `now()`). Until one is wired up the divisor is unused, tasks run
+/// untimed, and timer syscalls panic.
+pub fn start_first_task(_tick_divisor: u32, task: &task::Task) -> ! {
+    unsafe {
+        // Install the trap vector, direct mode (the low two bits of mtvec
+        // are zero because _hubris_trap_entry is 4-byte aligned and mode
+        // Direct is encoding 0): every trap lands at the same entry point.
+        core::arch::asm!(
+            "csrw mtvec, {}",
+            in(reg) _hubris_trap_entry as usize,
+            options(nostack, preserves_flags),
+        );
+
+        // Safety: `task` points into the live task table per our contract.
+        set_current_task(task);
+
+        // Enter the task through the same register-restore path every trap
+        // exit uses: mstatus.MPP is forced to U and MPIE to 1 there, so the
+        // mret at its end is a drop into U-mode at the task's saved pc.
+        // Global interrupts in M-mode (mstatus.MIE) remain 0 forever -- the
+        // kernel is not preemptible -- and mie is still in its reset state
+        // (no sources enabled), so U-mode MIE=1 delivers nothing yet.
+        _hubris_task_return()
+    }
 }
 
 /// Records which task is currently running, for the trap handler's benefit.
 ///
-/// TODO: unimplemented. Will write `mscratch`.
+/// The trap handler finds the current task through `mscratch`. Because
+/// `Task` is `repr(C)` with `save: SavedState` as its first field (the same
+/// layout contract arm_m's assembly relies on), the task pointer doubles as
+/// the pointer to its register save area.
+///
+/// The `CURRENT_TASK_PTR` static mirrors mscratch for the benefit of
+/// debuggers (Humility reads it by symbol) and matches arm_m.
 ///
 /// # Safety
 ///
-/// Caller must ensure `task` points into the live task table.
-pub unsafe fn set_current_task(_task: &task::Task) {
-    todo!("current task pointer")
+/// Caller must ensure `task` points into the live task table, and must not
+/// hold other references into it when the trap handler could run.
+pub unsafe fn set_current_task(task: &task::Task) {
+    CURRENT_TASK_PTR.store(task as *const _ as *mut _, Ordering::Relaxed);
+    crate::profiling::event_context_switch(task as *const _ as usize);
+    // Safety: writing mscratch has no side effect other than changing what
+    // the next trap entry uses as its spill base.
+    unsafe {
+        core::arch::asm!(
+            "csrw mscratch, {}",
+            in(reg) task as *const task::Task,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Mirror of `mscratch` for debugger consumption; see [`set_current_task`].
+#[unsafe(no_mangle)]
+static CURRENT_TASK_PTR: AtomicPtr<task::Task> = AtomicPtr::new(null_mut());
+
+unsafe extern "C" {
+    /// Trap entry point; only ever entered by the hardware via mtvec.
+    fn _hubris_trap_entry();
+    /// Register-restore path: resumes the task named by `mscratch`. Entered
+    /// by falling out of the trap handler, or directly by
+    /// [`start_first_task`].
+    fn _hubris_task_return() -> !;
+}
+
+// The trap entry/exit path.
+//
+// What ARMvX-M did in hardware happens here in instructions: nothing is
+// saved automatically, and the handler starts with the *task's* registers
+// live -- including sp, which is task-controlled and must not be used. The
+// escape hatch is mscratch, which holds the current Task pointer (== the
+// SavedState pointer, offset 0): `csrrw` swaps it with sp atomically,
+// giving us a trusted spill base without clobbering any task register.
+//
+// SavedState field offsets are load-bearing here (x1..x31 in order, pc at
+// 124); the const assertions below pin them.
+//
+// The kernel is not preemptible: mstatus.MIE stays 0 for the entire time
+// we are in M-mode (trap entry clears it; we never set it), so entries
+// never nest and the kernel stack can start fresh at _stack_start on every
+// entry.
+core::arch::global_asm!(
+    "
+    .section .text.hubris_trap_entry
+    .balign 4
+    .global _hubris_trap_entry
+    .global _hubris_task_return
+_hubris_trap_entry:
+    # sp <-> mscratch: sp now points at the current task's SavedState;
+    # the task's sp is parked in mscratch.
+    csrrw sp, mscratch, sp
+
+    # Spill the integer file in SavedState field order, except sp itself.
+    sw x1, 0(sp)
+    sw x3, 8(sp)
+    sw x4, 12(sp)
+    sw x5, 16(sp)
+    sw x6, 20(sp)
+    sw x7, 24(sp)
+    sw x8, 28(sp)
+    sw x9, 32(sp)
+    sw x10, 36(sp)
+    sw x11, 40(sp)
+    sw x12, 44(sp)
+    sw x13, 48(sp)
+    sw x14, 52(sp)
+    sw x15, 56(sp)
+    sw x16, 60(sp)
+    sw x17, 64(sp)
+    sw x18, 68(sp)
+    sw x19, 72(sp)
+    sw x20, 76(sp)
+    sw x21, 80(sp)
+    sw x22, 84(sp)
+    sw x23, 88(sp)
+    sw x24, 92(sp)
+    sw x25, 96(sp)
+    sw x26, 100(sp)
+    sw x27, 104(sp)
+    sw x28, 108(sp)
+    sw x29, 112(sp)
+    sw x30, 116(sp)
+    sw x31, 120(sp)
+
+    # Second swap: retrieve the task's sp (parking the Task pointer back
+    # in mscratch, where the next trap needs it) and finish the save.
+    csrrw t0, mscratch, sp
+    sw t0, 4(sp)
+    csrr t1, mepc
+    sw t1, 124(sp)
+
+    # Into Rust: a0 = task pointer, on a fresh kernel stack.
+    mv a0, sp
+    la sp, _stack_start
+    call _hubris_trap_dispatch
+
+    # Fall through: resume whichever task mscratch now names.
+_hubris_task_return:
+    csrr t0, mscratch
+
+    # Return to U-mode with interrupts enabled there: MPP <- 00, MPIE <- 1.
+    li t1, 0x1800
+    csrc mstatus, t1
+    li t1, 0x80
+    csrs mstatus, t1
+
+    lw t1, 124(t0)
+    csrw mepc, t1
+
+    # Restore everything except sp and t0 (x5), which we need as the base.
+    lw x1, 0(t0)
+    lw x3, 8(t0)
+    lw x4, 12(t0)
+    lw x6, 20(t0)
+    lw x7, 24(t0)
+    lw x8, 28(t0)
+    lw x9, 32(t0)
+    lw x10, 36(t0)
+    lw x11, 40(t0)
+    lw x12, 44(t0)
+    lw x13, 48(t0)
+    lw x14, 52(t0)
+    lw x15, 56(t0)
+    lw x16, 60(t0)
+    lw x17, 64(t0)
+    lw x18, 68(t0)
+    lw x19, 72(t0)
+    lw x20, 76(t0)
+    lw x21, 80(t0)
+    lw x22, 84(t0)
+    lw x23, 88(t0)
+    lw x24, 92(t0)
+    lw x25, 96(t0)
+    lw x26, 100(t0)
+    lw x27, 104(t0)
+    lw x28, 108(t0)
+    lw x29, 112(t0)
+    lw x30, 116(t0)
+    lw x31, 120(t0)
+    lw x2, 4(t0)
+    # t0 last, through itself.
+    lw x5, 16(x5)
+
+    mret
+    "
+);
+
+// Pin the SavedState offsets the assembly above spills to.
+const _: () = {
+    assert!(core::mem::offset_of!(SavedState, ra) == 0);
+    assert!(core::mem::offset_of!(SavedState, sp) == 4);
+    assert!(core::mem::offset_of!(SavedState, t0) == 16);
+    assert!(core::mem::offset_of!(SavedState, a7) == 64);
+    assert!(core::mem::offset_of!(SavedState, t6) == 120);
+    assert!(core::mem::offset_of!(SavedState, pc) == 124);
+};
+
+/// Rust half of the trap path: called by `_hubris_trap_entry` with the
+/// task's state already saved and the kernel stack live.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
+    let mstatus = read_csr!("mstatus");
+    // MPP != U means the trap came from the kernel itself. Note that by
+    // this point the entry sequence has already overwritten the interrupted
+    // task's SavedState with kernel register values -- acceptable only
+    // because we are about to panic and never resume anything.
+    if mstatus & 0x1800 != 0 {
+        panic!(
+            "kernel fault: mcause={:#010x} mepc={:#010x} mtval={:#010x}",
+            read_csr!("mcause"),
+            read_csr!("mepc"),
+            read_csr!("mtval"),
+        );
+    }
+
+    let mcause = read_csr!("mcause");
+    if (mcause as i32) < 0 {
+        // Interrupt. Nothing can be enabled yet (mie is never written), so
+        // this is unreachable until a tick source and an interrupt
+        // controller are wired up.
+        // TODO: dispatch timer tick and external interrupts here.
+        panic!("unexpected interrupt: mcause={:#010x}", mcause);
+    }
+
+    if mcause == 8 {
+        // Environment call from U-mode: a syscall. mepc points at the ecall
+        // itself (always 4 bytes -- not compressible); resume after it.
+        // Safety: the entry sequence passed us a valid task pointer, and we
+        // drop this reference before syscall_entry aliases the task table.
+        let nr = unsafe {
+            let save = (*task).save_mut();
+            save.pc = save.pc.wrapping_add(4);
+            save.a7
+        };
+        // Safety: state was saved by the entry sequence; we are the syscall
+        // interrupt handler; the kernel does not nest.
+        unsafe { crate::syscalls::syscall_entry(nr, task) };
+    } else {
+        // Safety: valid task pointer, per above.
+        unsafe { handle_fault(task, mcause) };
+    }
+}
+
+/// Delivers a fault taken in U-mode to the fault machinery, then picks a
+/// new task to run. Mirrors the tail of arm_m's `handle_fault`.
+unsafe fn handle_fault(task: *mut task::Task, mcause: u32) {
+    // Safety: dereferencing the trusted task pointer; result is dropped
+    // immediately so it doesn't alias the task table below.
+    let idx = unsafe { usize::from((*task).descriptor().index) };
+    let mtval = read_csr!("mtval");
+
+    let fault = match mcause {
+        // Instruction address misaligned / instruction access fault: the
+        // task's pc left its executable regions (or PMP said no).
+        0 | 1 => FaultInfo::IllegalText,
+        2 => FaultInfo::IllegalInstruction,
+        // Load/store address misaligned or access fault: mtval holds the
+        // offending data address.
+        4..=7 => FaultInfo::MemoryAccess {
+            address: Some(mtval),
+            source: FaultSource::User,
+        },
+        // Breakpoint (ebreak in task code) and anything unrecognized.
+        _ => FaultInfo::InvalidOperation(mcause),
+    };
+
+    with_task_table(|tasks| {
+        let next = match task::force_fault(tasks, idx, fault) {
+            task::NextTask::Specific(i) => &tasks[i],
+            task::NextTask::Other => task::select(idx, tasks),
+            task::NextTask::Same => &tasks[idx],
+        };
+
+        if core::ptr::eq(next as *const _, task as *const _) {
+            panic!("attempt to return to Task #{idx} after fault");
+        }
+
+        apply_memory_protection(next);
+        // Safety: this leaks a pointer aliasing next into static scope, but
+        // we're not going to read it back until the next kernel entry, so
+        // we won't be aliasing/racing.
+        unsafe {
+            set_current_task(next);
+        }
+    });
 }
 
 /// Reads the kernel tick counter.
@@ -333,16 +761,22 @@ pub fn now() -> Timestamp {
     todo!("tick counter")
 }
 
-/// Records the clock frequency, in kHz, for the tick.
-///
-/// TODO: unimplemented.
+/// Records the clock frequency, in kHz, mirroring arm_m: debuggers read
+/// this by symbol, and it is the value the eventual tick setup will
+/// consume.
 ///
 /// # Safety
 ///
 /// Caller must ensure this is called before the tick is started.
-pub unsafe fn set_clock_freq(_tick_divisor: u32) {
-    todo!("clock frequency")
+pub unsafe fn set_clock_freq(tick_divisor: u32) {
+    CLOCK_FREQ_KHZ.store(tick_divisor, Ordering::Relaxed);
 }
+
+/// The tick timer's input rate in kHz, for debugger consumption; see
+/// [`set_clock_freq`].
+#[unsafe(no_mangle)]
+static CLOCK_FREQ_KHZ: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Enables interrupt `n`, optionally clearing any pending instance first.
 ///
