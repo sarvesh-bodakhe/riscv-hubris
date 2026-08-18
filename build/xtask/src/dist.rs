@@ -788,10 +788,26 @@ pub fn package(
             .collect::<Result<_, _>>()?;
 
         // Check stack sizes and resolve task slots in our linked files
+        //
+        // TODO: the max-stack analysis in build/stack is Thumb-only (it
+        // disassembles with Capstone in Thumb mode and models Cortex-M
+        // interrupt stacking). Skip it for riscv32 rather than fail; this
+        // weakens a safety check and should be restored by teaching the
+        // analysis RISC-V.
+        let check_stack = !cfg.toml.target.starts_with("riscv32");
+        if !check_stack {
+            println!(
+                "warning: skipping stack overflow analysis \
+                 (not implemented for {})",
+                cfg.toml.target
+            );
+        }
         let mut possible_stack_overflow = vec![];
         for task_name in cfg.toml.tasks.keys() {
             if tasks_to_build.contains(task_name.as_str()) {
-                if task_can_overflow(&cfg.toml, task_name, verbose)? {
+                if check_stack
+                    && task_can_overflow(&cfg.toml, task_name, verbose)?
+                {
                     possible_stack_overflow.push(task_name);
                 }
                 if task_contains_home(&cfg.toml, task_name)? {
@@ -1056,12 +1072,23 @@ pub fn package(
             std::fs::write(cfg.img_file(&name, image_name), file_data)?;
         }
 
-        let fwid = hubtools::FwidGen::<sha3::Sha3_256>::fwid(&archive)?;
-        corim_builder.add_hash(
-            format!("image-{image_name}"),
-            10,
-            fwid.to_vec(),
-        );
+        // hubtools' FWID computation dispatches on the manifest's chip and
+        // only understands lpc55 and stm32. Skip the measurement for other
+        // chips rather than failing the build; nothing consumes it there.
+        if cfg.toml.chip.contains("lpc55") || cfg.toml.chip.contains("stm32") {
+            let fwid = hubtools::FwidGen::<sha3::Sha3_256>::fwid(&archive)?;
+            corim_builder.add_hash(
+                format!("image-{image_name}"),
+                10,
+                fwid.to_vec(),
+            );
+        } else {
+            println!(
+                "warning: skipping FWID measurement \
+                 (hubtools does not know chip {})",
+                cfg.toml.chip
+            );
+        }
     }
     let final_corim = corim_builder.build()?.to_vec()?;
 
@@ -1200,14 +1227,17 @@ fn build_archive(
         archive.copy(cfg.dist_file("auxi.tlvc"), img_dir.join("auxi.tlvc"))?;
     }
 
-    // Copy `openocd.cfg` into the archive if it exists; it's not used for
-    // the LPC55 boards.
+    // Copy `openocd.cfg` and `openocd.gdb` into the archive if they exist;
+    // they're not used for the LPC55 boards, and chips debugged through
+    // other tooling may not provide them at all.
     let openocd_cfg = chip_dir.join("openocd.cfg");
     if openocd_cfg.exists() {
         archive.copy(openocd_cfg, debug_dir.join("openocd.cfg"))?;
     }
-    archive
-        .copy(chip_dir.join("openocd.gdb"), debug_dir.join("openocd.gdb"))?;
+    let openocd_gdb = chip_dir.join("openocd.gdb");
+    if openocd_gdb.exists() {
+        archive.copy(openocd_gdb, debug_dir.join("openocd.gdb"))?;
+    }
 
     //
     // Iterate over tasks looking for elements that should be copied into
