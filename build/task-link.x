@@ -37,9 +37,16 @@ SECTIONS
     . = ALIGN(4);
     __sdata = .;
     *(.data .data.*);
+    /* RISC-V small-data sections; empty on ARM. */
+    *(.sdata .sdata.* .sdata2 .sdata2.*);
     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
     __edata = .;
   } > RAM AT>FLASH
+
+  /* RISC-V global pointer: mid-range of the small-data area, so gp-relative
+     addressing (+/- 2 KiB) covers as much of it as possible. Harmless and
+     unused on ARM. */
+  PROVIDE(__global_pointer$ = __sdata + 0x800);
 
   /*
    * Fill the remaining flash space with a known value
@@ -56,6 +63,8 @@ SECTIONS
     . = ALIGN(4);
     __sbss = .;
     *(.bss .bss.*);
+    /* RISC-V small-bss sections; empty on ARM. */
+    *(.sbss .sbss.*);
     . = ALIGN(4); /* 4-byte align the end (VMA) of this section */
     __ebss = .;
   } > RAM

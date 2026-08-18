@@ -131,7 +131,12 @@ impl PackageConfig {
             .to_string();
 
         let mut extra_hash = fnv::FnvHasher::default();
-        for f in ["task-link.x", "task-rlink.x", "kernel-link.x"] {
+        for f in [
+            "task-link.x",
+            "task-rlink.x",
+            "kernel-link.x",
+            "kernel-link-riscv32.x",
+        ] {
             let file_data = std::fs::read(Path::new("build").join(f))?;
             file_data.hash(&mut extra_hash);
         }
@@ -1618,7 +1623,14 @@ fn build_kernel(
         image_name,
     )?;
 
-    fs::copy("build/kernel-link.x", "target/link.x")?;
+    // The ARM kernel link script is built around the Cortex-M vector table
+    // and cortex-m-rt's reset machinery, neither of which exists on RISC-V.
+    let kernel_link_script = if cfg.toml.target.starts_with("riscv32") {
+        "build/kernel-link-riscv32.x"
+    } else {
+        "build/kernel-link.x"
+    };
+    fs::copy(kernel_link_script, "target/link.x")?;
 
     let image_id = image_id.finish();
 
@@ -1682,8 +1694,11 @@ fn update_image_header(
     if elf.header.container()? != Container::Little {
         bail!("where did you get a big-endian image?");
     }
-    if elf.header.e_machine != goblin::elf::header::EM_ARM {
-        bail!("this is not an ARM file");
+    if !matches!(
+        elf.header.e_machine,
+        goblin::elf::header::EM_ARM | goblin::elf::header::EM_RISCV
+    ) {
+        bail!("this is not an ARM or RISC-V file");
     }
 
     // Good enough.
@@ -2279,6 +2294,7 @@ fn link(
         "thumbv6m-none-eabi"
         | "thumbv7em-none-eabihf"
         | "thumbv8m.main-none-eabihf" => "armelf",
+        t if t.starts_with("riscv32") => "elf32lriscv",
         _ => bail!("No target emulation for '{}'", cfg.toml.target),
     };
     cmd.arg(src_file);
@@ -2966,8 +2982,11 @@ fn get_elf_entry_point(input: &Path) -> Result<u32> {
     if elf.header.container()? != Container::Little {
         bail!("where did you get a big-endian image?");
     }
-    if elf.header.e_machine != goblin::elf::header::EM_ARM {
-        bail!("this is not an ARM file");
+    if !matches!(
+        elf.header.e_machine,
+        goblin::elf::header::EM_ARM | goblin::elf::header::EM_RISCV
+    ) {
+        bail!("this is not an ARM or RISC-V file");
     }
 
     Ok(elf.header.e_entry as u32)
@@ -2986,7 +3005,10 @@ fn load_elf(
 
     // Checked in get_elf_entry_point above, but we'll re-check them here
     assert_eq!(elf.header.container()?, Container::Little);
-    assert_eq!(elf.header.e_machine, goblin::elf::header::EM_ARM);
+    assert!(matches!(
+        elf.header.e_machine,
+        goblin::elf::header::EM_ARM | goblin::elf::header::EM_RISCV
+    ));
 
     let mut flash = 0;
 
