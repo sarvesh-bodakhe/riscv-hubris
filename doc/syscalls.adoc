@@ -73,7 +73,29 @@ registers above `r7` are second-class. So it goes.
 
 === RISC-V
 
-Syscalls are invoked using the `ECALL` instruction. The rest is TBD.
+Syscalls are invoked using the `ECALL` instruction, executed from U-mode.
+`ECALL` takes no operand, so the syscall number is passed in a register
+(see below) rather than in the instruction itself.
+
+Arguments to syscalls are passed in `a0` through `a6`, with the syscall index
+in `a7`.
+
+Return values from syscalls are returned in `a0` through `a5`.
+
+Every other register is preserved across a syscall: RISC-V hardware saves
+nothing on trap entry, so the kernel's entry sequence spills the entire
+integer register file into the TCB and restores it on the way out. This is a
+stable part of the ABI, not an implementation accident -- the userlib stubs
+rely on it, for example by parking an output pointer in `t0` across the
+`ECALL`.
+
+NOTE: Unlike the ARM convention above, this is simply the standard calling
+convention's argument registers. The ARM rationale for avoiding them does not
+carry over: RISC-V stacks nothing on trap entry, so no argument register ever
+lands on the user stack, and the trap handler spills registers straight into
+the TCB regardless of which ones carry arguments. Using the `a` registers
+means the userspace stubs usually find their arguments already in the right
+place, and many collapse to little more than `li a7, n; ecall; ret`.
 
 == Syscalls
 
