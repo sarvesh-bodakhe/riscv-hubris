@@ -213,8 +213,35 @@ unsafe extern "C" fn sys_send_stub(_args: &mut SendArgs<'_>) -> RcLen {
                 ",
                 sysnum = const Sysnum::Send as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # The C ABI delivered the argument struct's address in a0.
+                # Unpack its seven fields into a0-a6, the syscall argument
+                # registers; the base pointer is consumed last since a0 is
+                # both source and destination.
+                lw a1, 4(a0)
+                lw a2, 8(a0)
+                lw a3, 12(a0)
+                lw a4, 16(a0)
+                lw a5, 20(a0)
+                lw a6, 24(a0)
+                lw a0, 0(a0)
+                # Load the constant syscall number.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # rc/len come back in a0/a1, exactly where the C ABI wants
+                # the RcLen u64. Nothing to restore: the kernel preserves
+                # every register except the a0-a5 return slots, and the
+                # a-registers are caller-saved anyway.
+                ret
+                ",
+                sysnum = const Sysnum::Send as u32,
+            )
         } else {
-            compile_error!("missing sys_send_stub for ARM profile");
+            compile_error!("missing sys_send_stub for this architecture");
         }
     }
 }
@@ -502,8 +529,32 @@ unsafe extern "C" fn sys_recv_stub(
                 ",
                 sysnum = const Sysnum::Recv as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # The first four arguments are already in a0-a3 where the
+                # kernel wants them. Stash the out-pointer (fifth argument,
+                # a4) in t0: the kernel writes results to a0-a5 but
+                # preserves every other register across ecall.
+                mv t0, a4
+                # Load the constant syscall number.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # rc is already in return position (a0). Write the other
+                # five results out through the raw output pointer.
+                sw a1, 0(t0)
+                sw a2, 4(t0)
+                sw a3, 8(t0)
+                sw a4, 12(t0)
+                sw a5, 16(t0)
+                ret
+                ",
+                sysnum = const Sysnum::Recv as u32,
+            )
         } else {
-            compile_error!("missing sys_recv_stub for ARM profile");
+            compile_error!("missing sys_recv_stub for this architecture");
         }
     }
 }
@@ -595,8 +646,22 @@ unsafe extern "C" fn sys_reply_stub(
                 ",
                 sysnum = const Sysnum::Reply as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # All four arguments are already in a0-a3 where the kernel
+                # wants them.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # This call has no results.
+                ret
+                ",
+                sysnum = const Sysnum::Reply as u32,
+            )
         } else {
-            compile_error!("missing sys_reply_stub for ARM profile");
+            compile_error!("missing sys_reply_stub for this architecture");
         }
     }
 }
@@ -705,8 +770,22 @@ unsafe extern "C" fn sys_set_timer_stub(
                 ",
                 sysnum = const Sysnum::SetTimer as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # All four arguments are already in a0-a3 where the kernel
+                # wants them.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # This call has no results.
+                ret
+                ",
+                sysnum = const Sysnum::SetTimer as u32,
+            )
         } else {
-            compile_error!("missing sys_set_timer_stub for ARM profile")
+            compile_error!("missing sys_set_timer_stub for this architecture")
         }
     }
 }
@@ -789,8 +868,27 @@ unsafe extern "C" fn sys_borrow_read_stub(_args: *mut BorrowReadArgs) -> RcLen {
                 ",
                 sysnum = const Sysnum::BorrowRead as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Unpack the argument struct (address in a0) into a0-a4;
+                # the base pointer is consumed last.
+                lw a1, 4(a0)
+                lw a2, 8(a0)
+                lw a3, 12(a0)
+                lw a4, 16(a0)
+                lw a0, 0(a0)
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # rc/len come back in a0/a1, forming the RcLen u64.
+                ret
+                ",
+                sysnum = const Sysnum::BorrowRead as u32,
+            )
         } else {
-            compile_error!("missing sys_borrow_read_stub for ARM profile")
+            compile_error!("missing sys_borrow_read_stub for this architecture")
         }
     }
 }
@@ -885,8 +983,27 @@ unsafe extern "C" fn sys_borrow_write_stub(
                 ",
                 sysnum = const Sysnum::BorrowWrite as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Unpack the argument struct (address in a0) into a0-a4;
+                # the base pointer is consumed last.
+                lw a1, 4(a0)
+                lw a2, 8(a0)
+                lw a3, 12(a0)
+                lw a4, 16(a0)
+                lw a0, 0(a0)
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # rc/len come back in a0/a1, forming the RcLen u64.
+                ret
+                ",
+                sysnum = const Sysnum::BorrowWrite as u32,
+            )
         } else {
-            compile_error!("missing sys_borrow_write_stub for ARM profile")
+            compile_error!("missing sys_borrow_write_stub for this architecture")
         }
     }
 }
@@ -997,8 +1114,27 @@ unsafe extern "C" fn sys_borrow_info_stub(
                 ",
                 sysnum = const Sysnum::BorrowInfo as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # The two arguments are already in a0-a1. Stash the
+                # out-pointer (a2) in t0, which the kernel preserves
+                # across ecall.
+                mv t0, a2
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # Results rc/atts/length arrive in a0-a2; store them.
+                sw a0, 0(t0)
+                sw a1, 4(t0)
+                sw a2, 8(t0)
+                ret
+                ",
+                sysnum = const Sysnum::BorrowInfo as u32,
+            )
         } else {
-            compile_error!("missing sys_borrow_write_stub for ARM profile")
+            compile_error!("missing sys_borrow_info_stub for this architecture")
         }
     }
 }
@@ -1086,8 +1222,22 @@ unsafe extern "C" fn sys_irq_control_stub(_mask: u32, _enable: u32) {
                 ",
                 sysnum = const Sysnum::IrqControl as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Both arguments are already in a0-a1 where the kernel
+                # wants them.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # This call returns no results.
+                ret
+                ",
+                sysnum = const Sysnum::IrqControl as u32,
+            )
         } else {
-            compile_error!("missing sys_irq_control stub for ARM profile")
+            compile_error!("missing sys_irq_control stub for this architecture")
         }
     }
 }
@@ -1145,8 +1295,26 @@ unsafe extern "C" fn sys_panic_stub(_msg: *const u8, _len: usize) -> ! {
                 ",
                 sysnum = const Sysnum::Panic as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Both arguments are already in a0-a1. We will not return.
+                # The ARM stubs push the callee-saved registers they are
+                # about to load with arguments, so that the state that led
+                # to the panic can still be reconstructed. Here the only
+                # register written is a7, which no caller expects to keep,
+                # so there is nothing to save.
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # The kernel does not resume us; trap if it somehow does.
+                unimp
+                ",
+                sysnum = const Sysnum::Panic as u32,
+            )
         } else {
-            compile_error!("missing sys_panic_stub for ARM profile")
+            compile_error!("missing sys_panic_stub for this architecture")
         }
     }
 }
@@ -1262,8 +1430,29 @@ unsafe extern "C" fn sys_get_timer_stub(_out: *mut RawTimerState) {
                 ",
                 sysnum = const Sysnum::GetTimer as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Stash the out-pointer (a0) in t0, which the kernel
+                # preserves across ecall; all six results arrive in a0-a5.
+                mv t0, a0
+                li a7, {sysnum}
+
+                # To the kernel!
+                ecall
+
+                # Write all the results out into the raw output buffer.
+                sw a0, 0(t0)
+                sw a1, 4(t0)
+                sw a2, 8(t0)
+                sw a3, 12(t0)
+                sw a4, 16(t0)
+                sw a5, 20(t0)
+                ret
+                ",
+                sysnum = const Sysnum::GetTimer as u32,
+            )
         } else {
-            compile_error!("missing sys_get_timer_stub for ARM profile")
+            compile_error!("missing sys_get_timer_stub for this architecture")
         }
     }
 }
@@ -1387,8 +1576,63 @@ pub unsafe extern "C" fn _start() -> ! {
                 ",
                 main = sym main,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Set up the global pointer, which linker relaxation uses
+                # to shorten accesses to globals. Relaxation must be off
+                # while we do it, or this very instruction would be
+                # relaxed into a gp-relative nop. The kernel gives us sp
+                # (from the task descriptor) but gp is our own job.
+                .option push
+                .option norelax
+                la gp, __global_pointer$
+                .option pop
+
+                # Copy data initialization image into data section.
+                # Note: this assumes that both source and destination are
+                # 32-bit aligned and padded to 4-byte boundary.
+
+                la a0, __edata          # upper bound in a0
+                la a1, __sidata         # source in a1
+                la a2, __sdata          # dest in a2
+
+                j 1f                    # check for zero-sized data
+
+            2:  lw a3, 0(a1)            # read and advance source
+                addi a1, a1, 4
+                sw a3, 0(a2)            # write and advance dest
+                addi a2, a2, 4
+
+            1:  bne a2, a0, 2b          # has dest reached the upper bound?
+
+                # Zero BSS section.
+
+                la a0, __ebss           # upper bound in a0
+                la a1, __sbss           # base in a1
+
+                j 1f                    # check for zero-sized BSS
+
+            2:  sw zero, 0(a1)          # zero one word and advance
+                addi a1, a1, 4
+
+            1:  bne a1, a0, 2b          # has base reached bound?
+
+                # No barrier needed here: a single hart observes its own
+                # data writes in program order, and we wrote no code.
+
+                # Now, to the user entry point. We call it in case it
+                # returns. (It's not supposed to.) We reference it through
+                # a sym operand because it's a Rust func and may be
+                # mangled.
+                call {main}
+
+                # Trap if main somehow returns.
+                unimp
+                ",
+                main = sym main,
+            )
         } else {
-            compile_error!("missing .start routine for ARM profile")
+            compile_error!("missing .start routine for this architecture")
         }
     }
 }
@@ -1644,8 +1888,19 @@ unsafe extern "C" fn sys_refresh_task_id_stub(_tid: u32) -> u32 {
                 ",
                 sysnum = const Sysnum::RefreshTaskId as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # The argument is already in a0; the result returns in a0.
+                li a7, {sysnum}
+                ecall
+                ret
+                ",
+                sysnum = const Sysnum::RefreshTaskId as u32,
+            )
         } else {
-            compile_error!("missing sys_refresh_task_id stub for ARM profile")
+            compile_error!(
+                "missing sys_refresh_task_id stub for this architecture"
+            )
         }
     }
 }
@@ -1712,8 +1967,18 @@ unsafe extern "C" fn sys_post_stub(_tid: u32, _mask: u32) -> u32 {
                 ",
                 sysnum = const Sysnum::Post as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Both arguments are already in a0-a1; the result returns
+                # in a0.
+                li a7, {sysnum}
+                ecall
+                ret
+                ",
+                sysnum = const Sysnum::Post as u32,
+            )
         } else {
-            compile_error!("missing sys_post_stub for ARM profile")
+            compile_error!("missing sys_post_stub for this architecture")
         }
     }
 }
@@ -1777,8 +2042,19 @@ unsafe extern "C" fn sys_reply_fault_stub(_tid: u32, _reason: u32) {
                 ",
                 sysnum = const Sysnum::ReplyFault as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # Both arguments are already in a0-a1 where the kernel
+                # wants them.
+                li a7, {sysnum}
+                ecall
+                # This call returns no results.
+                ret
+                ",
+                sysnum = const Sysnum::ReplyFault as u32,
+            )
         } else {
-            compile_error!("missing sys_reply_fault_stub for ARM profile")
+            compile_error!("missing sys_reply_fault_stub for this architecture")
         }
     }
 }
@@ -1859,8 +2135,17 @@ unsafe extern "C" fn sys_irq_status_stub(_mask: u32) -> u32 {
                 ",
                 sysnum = const Sysnum::IrqStatus as u32,
             )
+        } else if #[cfg(target_arch = "riscv32")] {
+            arch::naked_asm!("
+                # The argument is already in a0; the result returns in a0.
+                li a7, {sysnum}
+                ecall
+                ret
+                ",
+                sysnum = const Sysnum::IrqStatus as u32,
+            )
         } else {
-            compile_error!("missing sys_irq_status stub for ARM profile")
+            compile_error!("missing sys_irq_status stub for this architecture")
         }
     }
 }
