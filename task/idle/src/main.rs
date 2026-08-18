@@ -26,5 +26,16 @@ fn main() -> ! {
         // which could wake some higher-priority task.
         #[cfg(all(not(feature = "insomniac"), target_arch = "arm"))]
         cortex_m::asm::wfi();
+
+        // RISC-V has the same instruction by the same name. On a core with
+        // only M and U modes, executing it in U-mode is legal as long as
+        // mstatus.TW is 0 (the reset value); if a platform sets TW, the
+        // resulting illegal-instruction fault will make that loudly
+        // obvious. A core that also implements S-mode may make a U-mode
+        // wfi illegal outright (privileged spec, "Wait for Interrupt").
+        #[cfg(all(not(feature = "insomniac"), target_arch = "riscv32"))]
+        unsafe {
+            core::arch::asm!("wfi");
+        }
     }
 }
