@@ -889,6 +889,25 @@ unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
     }
 }
 
+/// Whether `sp` has dropped below the RAM region that holds this task's
+/// stack -- the RISC-V signature of a stack overflow, which the ISA gives
+/// no dedicated trap for.
+///
+/// Hubris places the stack at the low end of a task's RAM region and grows
+/// it downward, so the stack's region is the one containing the initial
+/// stack pointer, and an `sp` below that region's base means the stack ran
+/// off the bottom and the faulting store landed outside the region. A
+/// stray pointer, by contrast, faults with `sp` still in range.
+fn stack_overflowed(task: &task::Task, sp: u32) -> bool {
+    let initial = task.descriptor().initial_stack as usize;
+    for region in task.region_table().iter() {
+        if region.contains(initial.saturating_sub(4)) {
+            return sp < region.base;
+        }
+    }
+    false
+}
+
 /// Delivers a fault taken in U-mode to the fault machinery, then picks a
 /// new task to run. Mirrors the tail of arm_m's `handle_fault`.
 unsafe fn handle_fault(task: *mut task::Task, mcause: u32) {
@@ -903,11 +922,31 @@ unsafe fn handle_fault(task: *mut task::Task, mcause: u32) {
         0 | 1 => FaultInfo::IllegalText,
         2 => FaultInfo::IllegalInstruction,
         // Load/store address misaligned or access fault: mtval holds the
-        // offending data address.
-        4..=7 => FaultInfo::MemoryAccess {
-            address: Some(mtval),
-            source: FaultSource::User,
-        },
+        // offending data address. RISC-V has no dedicated stack-overflow
+        // trap (unlike the Cortex-M stack-limit register), so a stack that
+        // overran its region arrives here as an ordinary access fault. We
+        // separate the two by the one fact that distinguishes them: an
+        // overflow has driven the task's own stack pointer below the
+        // region that holds its stack, while a stray pointer leaves it
+        // valid. Cheap, and only on the (already slow) fault path.
+        //
+        // An overflow reports the stack pointer, the "bad stack address"
+        // of the ABI and what arm_m reports (its psp). mtval is the
+        // address of the access that faulted, somewhere in the frame
+        // being built, and is what a plain memory fault reports.
+        4..=7 => {
+            // Safety: `task` is the trusted faulting-task pointer; we only
+            // read from it.
+            let sp = unsafe { (*task).save().sp };
+            if unsafe { stack_overflowed(&*task, sp) } {
+                FaultInfo::StackOverflow { address: sp }
+            } else {
+                FaultInfo::MemoryAccess {
+                    address: Some(mtval),
+                    source: FaultSource::User,
+                }
+            }
+        }
         // Breakpoint (ebreak in task code) and anything unrecognized.
         _ => FaultInfo::InvalidOperation(mcause),
     };
