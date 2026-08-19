@@ -1146,6 +1146,35 @@ fn write_gdb_script(cfg: &PackageConfig, image_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Corrects `e_machine` in a synthesized image, which hubtools writes as
+/// `EM_ARM` unconditionally.
+///
+/// Everything else about the image is already architecture-neutral; only
+/// this one header field is wrong. Left uncorrected it is not a cosmetic
+/// problem: every downstream tool identifies the architecture from it, so
+/// loaders refuse the image outright and disassemblers decode ARM.
+///
+/// Upstreamable: hubtools should take the machine from the segments it was
+/// given. Until it does, correcting it here is cheaper than making every
+/// consumer work around it.
+fn fixup_elf_machine(elf: &mut [u8], target: &str) -> Result<()> {
+    let machine = if target.starts_with("riscv32") {
+        goblin::elf::header::EM_RISCV
+    } else {
+        // Leave anything else exactly as hubtools produced it.
+        return Ok(());
+    };
+
+    // e_machine is a little-endian u16 at offset 18 of the ELF header, for
+    // both ELF32 and ELF64.
+    const E_MACHINE_OFFSET: usize = 18;
+    let field = elf
+        .get_mut(E_MACHINE_OFFSET..E_MACHINE_OFFSET + 2)
+        .ok_or_else(|| anyhow!("image is too short to be an ELF file"))?;
+    field.copy_from_slice(&machine.to_le_bytes());
+    Ok(())
+}
+
 fn build_archive(
     cfg: &PackageConfig,
     image_name: &str,
@@ -1211,7 +1240,9 @@ fn build_archive(
     archive.copy(cfg.img_file("kernel", image_name), elf_dir.join("kernel"))?;
 
     let img_dir = PathBuf::from("img");
-    archive.binary(img_dir.join("final.elf"), raw_image.to_elf()?)?;
+    let mut final_elf = raw_image.to_elf()?;
+    fixup_elf_machine(&mut final_elf, &cfg.toml.target)?;
+    archive.binary(img_dir.join("final.elf"), final_elf)?;
     archive.binary(img_dir.join("final.bin"), raw_image.to_binary()?)?;
 
     //
