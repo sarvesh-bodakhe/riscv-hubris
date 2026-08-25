@@ -28,6 +28,7 @@
 //!
 //! | Name | Kind | Contract |
 //! |---|---|---|
+//! | `MTVEC_MODE` | `const usize` | low bits OR-ed into the `mtvec` base (0 = direct, 1 = vectored, 3 = CLIC) |
 //! | `PMP_ENTRIES` | `const usize` | PMP entries the core implements and the kernel programs per task: 8 or 16. Must match the `[pmp] entries` the chip description gives the build (checked at compile time) |
 //! | `PMP_GRANULARITY` | `const u32` | smallest NAPOT region the PMP expresses exactly; smaller access-granting regions are rejected at build time |
 //! | `init(tick_divisor)` | `fn` | one-shot hardware init before the first task: bus gates, coprocessor disable, tick timer, interrupt routing. Called with `mstatus.MIE` clear and `mtvec` already installed, so it may unmask interrupt sources freely. |
@@ -591,12 +592,17 @@ pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
             options(nostack, preserves_flags),
         );
 
-        // Install the trap vector, direct mode (the low two bits of mtvec
-        // are zero because _hubris_trap_entry is 4-byte aligned and mode
-        // Direct is encoding 0): every trap lands at the same entry point.
+        // Install the trap vector: _hubris_trap_entry is a 32-slot jump
+        // table (see its comments) covering direct, vectored and CLIC
+        // dispatch alike. The mode bits are the chip's choice; the base
+        // is 256-byte aligned because the spec lets an implementation
+        // hardwire low bits of the mtvec base, and some do so for bits
+        // [7:2], silently truncating anything less aligned.
+        let entry = _hubris_trap_entry as *const () as usize;
+        uassert!(entry & 0xFF == 0);
         core::arch::asm!(
             "csrw mtvec, {}",
-            in(reg) _hubris_trap_entry as usize,
+            in(reg) entry | chip::MTVEC_MODE,
             options(nostack, preserves_flags),
         );
     }
@@ -676,10 +682,43 @@ unsafe extern "C" {
 core::arch::global_asm!(
     "
     .section .text.hubris_trap_entry
-    .balign 4
+
+    # The trap vector is a 32-slot jump table, every slot leading to the
+    # same entry sequence, because implementations disagree about
+    # dispatch and this shape satisfies all of them:
+    #
+    # - direct mode (mtvec.MODE = 0) and CLIC mode without selective
+    #   hardware vectoring: everything -- traps and interrupts -- arrives
+    #   at the base, i.e. slot 0;
+    # - vectored mode (MODE = 1): exceptions arrive at the base and
+    #   interrupt cause n at base + 4*n, slots 1..31. Some cores force
+    #   this mode (the MODE field is WARL and reads back 1 whatever was
+    #   written), so the table cannot be optional.
+    #
+    # 256-byte alignment, not the 64 the spec suggests: an implementation
+    # may hardwire low bits of the base, and one that zeroes bits [7:2]
+    # silently truncates a 64-byte-aligned base, so that every trap lands
+    # 0..192 bytes *before* the handler -- in whatever code the linker put
+    # there.
+    .balign 256
     .global _hubris_trap_entry
     .global _hubris_task_return
+    # Compression off for the table itself: the hardware's vectored
+    # dispatch strides 4 bytes per cause, so every slot must be exactly
+    # one uncompressed jump. With RVC left on, the assembler shrinks
+    # these to 2-byte c.j -- and then causes 16..31 land past the end of
+    # the halved table, in the middle of the entry sequence below. (Low
+    # causes still landed on valid jumps by accident, which is why the
+    # tick and the first task IRQs worked; discovered by inspection, not
+    # by crash.)
+    .option push
+    .option norvc
 _hubris_trap_entry:
+    .rept 32
+    j _hubris_trap_entry_common
+    .endr
+    .option pop
+_hubris_trap_entry_common:
     # sp <-> mscratch: sp now points at the current task's SavedState;
     # the task's sp is parked in mscratch.
     csrrw sp, mscratch, sp
@@ -825,7 +864,13 @@ unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
         return;
     }
 
-    if mcause == 8 {
+    // Synchronous trap. The exception code is bits 11:0 -- masking matters
+    // because in CLIC mode the upper bits of mcause carry the previous
+    // privilege mode, interrupt enable and interrupt level, and comparing
+    // the whole register against a cause number silently never matches.
+    // (In non-CLIC modes the upper bits read 0 and the mask is harmless.)
+    let code = mcause & 0xFFF;
+    if code == 8 {
         // Environment call from U-mode: a syscall. mepc points at the ecall
         // itself (always 4 bytes -- not compressible); resume after it.
         // Safety: the entry sequence passed us a valid task pointer, and we
@@ -840,7 +885,7 @@ unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
         unsafe { crate::syscalls::syscall_entry(nr, task) };
     } else {
         // Safety: valid task pointer, per above.
-        unsafe { handle_fault(task, mcause) };
+        unsafe { handle_fault(task, code) };
     }
 }
 
