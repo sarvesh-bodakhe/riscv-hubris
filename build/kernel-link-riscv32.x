@@ -120,7 +120,10 @@ SECTIONS
   /* ## Discarded sections */
   /DISCARD/ :
   {
-    /* Unwinding info only wastes space; the kernel aborts on panic. */
+    /* Unwinding info only wastes space; the kernel aborts on panic.
+       (The call-frame info Humility unwinds with is emitted into
+       .debug_frame instead -- non-alloc, so it rides in the ELF without
+       ever being part of the image; see dist.rs.) */
     *(.eh_frame .eh_frame_hdr);
   }
 }

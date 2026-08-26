@@ -2191,9 +2191,36 @@ fn build(
     cmd.env(
         "RUSTFLAGS",
         format!(
-            "{COMMON_RUSTFLAGS} -C metadata={} {}",
+            "{COMMON_RUSTFLAGS} -C metadata={} {}{}",
             cfg.link_script_hash,
             cfg.remap_path_flags(),
+            // LLVM's riscv backend, unlike its ARM backend, emits no
+            // DWARF call-frame info with plain debuginfo -- and Humility's
+            // stack unwinding is built on exactly that info. Asking via
+            // -C force-unwind-tables would produce .eh_frame, an ALLOC
+            // section with miserable interactions with the two-stage task
+            // link's --gc-sections (reaped without a KEEP; pins dead code
+            // with one). This LLVM flag instead emits the same tables as
+            // .debug_frame -- non-alloc, gc-immune, never in the flashed
+            // image, and precisely the section Humility already consumes
+            // on ARM.
+            // -dwarf-inlined-strings works around an lld bug in the
+            // riscv task link: in a relocatable (-r) link, relocations
+            // from .debug_info into the mergeable .debug_str lose their
+            // section symbol (R_RISCV_32 against symbol 0), so every
+            // DWARF name and comp_dir in a final task ELF resolves to
+            // .debug_str offset 0 -- one arbitrary constant string per
+            // task. (ARM -r links keep their R_ARM_ABS32 .debug_str
+            // relocations, which is why upstream never met this.)
+            // Inlining the strings into .debug_info (DW_FORM_string)
+            // removes the relocations entirely, at the cost of a fatter
+            // non-alloc debug section in the archive.
+            if cfg.toml.target.starts_with("riscv32") {
+                " -C llvm-args=-force-dwarf-frame-section \
+                  -C llvm-args=-dwarf-inlined-strings=Enable"
+            } else {
+                ""
+            },
         ),
     );
     cmd.env("RUSTC_BOOTSTRAP", "1");
