@@ -1,0 +1,20 @@
+[package]
+edition = "2024"
+name = "demo-esp32c6"
+version = "0.1.0"
+
+[features]
+esp32c6 = ["kern/esp32c6"]
+
+[dependencies]
+kern = { path = "../../sys/kern" }
+
+# this lets you use `cargo fix`!
+[[bin]]
+name = "demo-esp32c6"
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

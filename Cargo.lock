@@ -1066,6 +1066,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffe7ed1d93f4553003e20b629abe9085e1e81b1429520f897f8f8860bc6dfc21"
 
 [[package]]
+name = "demo-esp32c6"
+version = "0.1.0"
+dependencies = [
+ "kern",
+]
+
+[[package]]
 name = "demo-stm32f4-discovery"
 version = "0.1.0"
 dependencies = [
@@ -1394,6 +1401,20 @@ dependencies = [
  "derive-idol-err",
  "drv-i2c-api",
  "drv-i2c-devices",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "drv-esp32c6-uart"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "esp32c6",
  "idol",
  "idol-runtime",
  "num-traits",

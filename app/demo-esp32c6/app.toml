@@ -1,0 +1,56 @@
+# ESP32-C6, minimal: the supervisor, the console driver, hello printing
+# through it over IPC, a victim task hello breaks on purpose, and idle.
+# The image runs from SRAM. Nothing here uses the radio, and DMA is not
+# confined (see the chip module).
+
+name = "demo-esp32c6"
+target = "riscv32imac-unknown-none-elf"
+board = "esp32c6-generic"
+chip = "../../chips/esp32c6"
+stacksize = 1024
+
+[kernel]
+name = "demo-esp32c6"
+requires = {flash = 32768, ram = 8192}
+features = ["esp32c6"]
+
+[tasks.jefe]
+name = "task-jefe"
+priority = 0
+max-sizes = {flash = 16384, ram = 4096}
+start = true
+stacksize = 1536
+notifications = ["fault", "timer"]
+
+[tasks.uart_driver]
+name = "drv-esp32c6-uart"
+priority = 2
+max-sizes = {flash = 16384, ram = 2048}
+stacksize = 1024
+uses = ["uart0"]
+start = true
+notifications = ["uart-irq"]
+interrupts = {"uart0.irq" = "uart-irq"}
+
+[tasks.victim]
+name = "task-esp32c6-demo-victim"
+priority = 5
+max-sizes = {flash = 8192, ram = 2048}
+stacksize = 1024
+start = true
+
+[tasks.hello]
+name = "task-esp32c6-hello"
+priority = 6
+max-sizes = {flash = 8192, ram = 1024}
+stacksize = 512
+start = true
+task-slots = ["uart_driver", "victim"]
+features = ["demo-victim"]
+
+[tasks.idle]
+name = "task-idle"
+priority = 7
+max-sizes = {flash = 256, ram = 256}
+stacksize = 256
+start = true
