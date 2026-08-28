@@ -2944,6 +2944,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-uart-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
 name = "drv-update-api"
 version = "0.1.0"
 dependencies = [
@@ -6343,6 +6356,41 @@ dependencies = [
  "userlib",
  "zerocopy 0.8.27",
  "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "task-esp32c6-demo-victim"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "task-esp32c6-demo-victim-api"
+version = "0.1.0"
+dependencies = [
+ "counters",
+ "idol",
+ "idol-runtime",
+ "num-traits",
+ "userlib",
+ "zerocopy 0.8.27",
+ "zerocopy-derive 0.8.27",
+]
+
+[[package]]
+name = "task-esp32c6-hello"
+version = "0.1.0"
+dependencies = [
+ "drv-uart-api",
+ "task-esp32c6-demo-victim-api",
+ "userlib",
 ]
 
 [[package]]

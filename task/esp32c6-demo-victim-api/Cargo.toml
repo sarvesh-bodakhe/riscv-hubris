@@ -1,0 +1,24 @@
+[package]
+name = "task-esp32c6-demo-victim-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+
+counters = { path = "../../lib/counters" }
+idol-runtime = { workspace = true }
+userlib = { path = "../../sys/userlib" }
+
+[build-dependencies]
+idol = { workspace = true }
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[lints]
+workspace = true

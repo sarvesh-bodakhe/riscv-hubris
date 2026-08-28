@@ -1,0 +1,22 @@
+[package]
+name = "task-esp32c6-hello"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+drv-uart-api = { path = "../../drv/uart-api" }
+task-esp32c6-demo-victim-api = { path = "../../task/esp32c6-demo-victim-api", optional = true }
+userlib = { path = "../../sys/userlib" }
+
+[features]
+# Enabled by an app.toml whose image has a victim task: hello then asks
+# it to break itself, a few ticks in, and reports what happened.
+demo-victim = ["dep:task-esp32c6-demo-victim-api"]
+
+[[bin]]
+name = "task-esp32c6-hello"
+test = false
+bench = false
+
+[lints]
+workspace = true

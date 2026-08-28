@@ -1,0 +1,24 @@
+// UART console IPC API.
+//
+// One operation: send bytes. The driver blocks the caller until the
+// whole lease has been pushed into the TX FIFO (spinning politely when
+// the FIFO is nearly full), so a returned Ok means "handed to the
+// hardware", not "on the wire". There is no read operation yet: received
+// bytes are echoed by the driver as a bring-up affordance, and a real
+// console protocol replaces that when something needs input.
+
+Interface(
+    name: "Uart",
+    ops: {
+        "write": (
+            args: {},
+            leases: {
+                "source": (type: "[u8]", read: true, max_len: Some(1024)),
+            },
+            reply: Result(
+                ok: "()",
+                err: ServerDeath,
+            ),
+        ),
+    },
+)

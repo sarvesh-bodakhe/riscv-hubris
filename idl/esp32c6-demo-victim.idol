@@ -1,0 +1,35 @@
+// A task that can be asked to break itself, so the supervisor's fault
+// handling and the PMP's memory isolation can be demonstrated live
+// rather than asserted in a document.
+
+Interface(
+    name: "Victim",
+    ops: {
+        "alive": (
+            doc: "Returns the value passed in. Proves the task is running.",
+            args: { "token": "u32" },
+            reply: Result(
+                ok: "u32",
+                err: ServerDeath,
+            ),
+        ),
+        // These two are expected to kill the server, so their replies
+        // must carry ServerDeath: the caller learns of the death as an
+        // error value instead of being taken down with it.
+        "panic_now": (
+            doc: "Panics. The reply never arrives; the supervisor restarts the task.",
+            reply: Result(
+                ok: "()",
+                err: ServerDeath,
+            ),
+        ),
+        "read_foreign": (
+            doc: "Reads an address outside this task's regions. The load faults.",
+            args: { "addr": "u32" },
+            reply: Result(
+                ok: "u32",
+                err: ServerDeath,
+            ),
+        ),
+    },
+)

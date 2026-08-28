@@ -1,0 +1,27 @@
+[package]
+name = "task-esp32c6-demo-victim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+idol-runtime = { workspace = true }
+num-traits = { workspace = true }
+zerocopy = { workspace = true }
+zerocopy-derive = { workspace = true }
+
+userlib = { path = "../../sys/userlib" }
+
+[build-dependencies]
+build-util = { path = "../../build/util" }
+idol = { workspace = true }
+
+[[bin]]
+name = "task-esp32c6-demo-victim"
+test = false
+bench = false
+
+[features]
+panic-messages = ["userlib/panic-messages"]
+
+[lints]
+workspace = true
