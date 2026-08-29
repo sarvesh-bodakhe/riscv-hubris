@@ -31,6 +31,8 @@
 //! | `PMP_ENTRIES` | `const usize` | PMP entries the core implements and the kernel programs per task: 8 or 16. Must match the `[pmp] entries` the chip description gives the build (checked at compile time) |
 //! | `PMP_GRANULARITY` | `const u32` | smallest NAPOT region the PMP expresses exactly; smaller access-granting regions are rejected at build time |
 //! | `init(tick_divisor)` | `fn` | one-shot hardware init before the first task: bus gates, coprocessor disable, tick timer, interrupt routing. Called with `mstatus.MIE` clear and `mtvec` already installed, so it may unmask interrupt sources freely. |
+//! | `decode_interrupt(mcause)` | `fn -> Option<InterruptEvent>` | classify an asynchronous trap |
+//! | `ack_tick()` | `fn` | silence the tick interrupt at its source |
 //! | `enable_irq` / `disable_irq` / `irq_status` / `pend_software_irq` | `fn` | the kernel's IRQ interface, in Hubris `InterruptNum` numbering |
 //! | `reset()` | `fn -> !` | restart the system |
 //!
@@ -84,7 +86,7 @@ use crate::startup::with_task_table;
 use crate::task;
 use crate::time::Timestamp;
 use crate::umem::USlice;
-use abi::{FaultInfo, FaultSource};
+use abi::{FaultInfo, FaultSource, InterruptNum};
 use unwrap_lite::UnwrapLite;
 
 // The kernel requires an atomic swap operation, abstracted behind
@@ -175,6 +177,17 @@ cfg_if::cfg_if! {
 // The chip module implements these directly; they are part of the arch
 // interface the portable kernel consumes.
 pub use chip::{disable_irq, enable_irq, irq_status, pend_software_irq, reset};
+
+/// What an asynchronous trap turned out to be, as classified by
+/// `chip::decode_interrupt`. How an interrupt's identity is recovered --
+/// CLIC id in `mcause`, PLIC claim register, plain `mcause` code -- is a
+/// chip matter; what to *do* about it is not.
+pub(crate) enum InterruptEvent {
+    /// The kernel tick timer fired.
+    Tick,
+    /// A peripheral interrupt source, in Hubris `InterruptNum` numbering.
+    Peripheral(u32),
+}
 
 /// RISC-V integer registers that must be saved across a context switch.
 ///
@@ -796,11 +809,20 @@ unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
 
     let mcause = read_csr!("mcause");
     if (mcause as i32) < 0 {
-        // Interrupt. Nothing can be enabled yet (mie is never written), so
-        // this is unreachable until a tick source and an interrupt
-        // controller are wired up.
-        // TODO: dispatch timer tick and external interrupts here.
-        panic!("unexpected interrupt: mcause={:#010x}", mcause);
+        // Interrupt. Recovering its identity from mcause is a chip matter
+        // (a CLIC id in mcause, a PLIC claim, a vendor CSR).
+        match chip::decode_interrupt(mcause) {
+            Some(InterruptEvent::Tick) => {
+                // Safety: valid task pointer, per our contract.
+                unsafe { handle_tick(task) }
+            }
+            Some(InterruptEvent::Peripheral(source)) => {
+                // Safety: valid task pointer, per our contract.
+                unsafe { handle_peripheral_irq(task, source) }
+            }
+            None => panic!("unexpected interrupt: mcause {mcause:#010x}"),
+        }
+        return;
     }
 
     if mcause == 8 {
@@ -868,14 +890,121 @@ unsafe fn handle_fault(task: *mut task::Task, mcause: u32) {
 
 /// Reads the kernel tick counter.
 ///
-/// TODO: unimplemented.
-///
-/// Note the privileged spec mandates no timer: `mtime`/`mtimecmp` exist on
-/// many cores but not all, and some provide timekeeping only through a
-/// vendor peripheral routed as an ordinary external interrupt. Where the
-/// tick comes from is a per-chip decision, not an ISA one.
+/// Like arm_m, the kernel's time is this software counter, advanced by the
+/// chip's tick interrupt -- not a hardware count register. (A tickless
+/// design reading the chip's timer directly is possible later.)
 pub fn now() -> Timestamp {
-    todo!("tick counter")
+    // The tick interrupt cannot preempt kernel code (mstatus.MIE is 0 in
+    // M-mode), so reading the two halves nonatomically is fine.
+    Timestamp::from([
+        TICKS[0].load(Ordering::Relaxed),
+        TICKS[1].load(Ordering::Relaxed),
+    ])
+}
+
+/// Kernel global tracking the current time in ticks; `TICKS[0]` is the
+/// least significant word. Split like arm_m: no 64-bit atomics on rv32,
+/// and none needed -- this is only touched from non-preemptible kernel code.
+static TICKS: [core::sync::atomic::AtomicU32; 2] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    [ZERO; 2]
+};
+
+/// Handles the kernel tick interrupt: advance time, run timers, and switch
+/// tasks if a timer fired.
+///
+/// # Safety
+///
+/// `task` must be the valid pointer passed in by the trap entry sequence.
+unsafe fn handle_tick(task: *mut task::Task) {
+    crate::profiling::event_timer_isr_enter();
+    // Silence the interrupt at its source before the next tick.
+    chip::ack_tick();
+
+    // Safety: dereferencing the trusted task pointer; dropped immediately
+    // so it does not alias the task table below.
+    let idx = unsafe { usize::from((*task).descriptor().index) };
+
+    // Advance the kernel's notion of time by one tick; mirrors arm_m.
+    let t0 = TICKS[0].load(Ordering::Relaxed);
+    let t1 = TICKS[1].load(Ordering::Relaxed);
+    let (t0, t1) = if let Some(t0p) = t0.checked_add(1) {
+        TICKS[0].store(t0p, Ordering::Relaxed);
+        (t0p, t1)
+    } else {
+        // Low word rolled over. The high word takes a plain `+`, not a
+        // wrapping add, as in arm_m: it cannot overflow in normal
+        // operation, and a build with overflow checks on would catch the
+        // state corruption that made it.
+        TICKS[0].store(0, Ordering::Relaxed);
+        TICKS[1].store(t1 + 1, Ordering::Relaxed);
+        (0, t1 + 1)
+    };
+
+    with_task_table(|tasks| {
+        let now = Timestamp::from([t0, t1]);
+        let switch = task::process_timers(tasks, now);
+
+        // A timer that fires only makes its task runnable. Whether that
+        // task runs now is the scheduler's decision, because the task we
+        // interrupted, or another, may outrank it: so ask `select`, and
+        // do not take `process_timers`' `Specific` hint as the answer.
+        // arm_m gets the same result by pending PendSV, whose handler
+        // always calls `select`; it defers because its tick entry doesn't
+        // save full task state. Ours does -- every trap entry spills the
+        // whole register file -- so we can switch directly.
+        if switch != task::NextTask::Same {
+            let next = task::select(idx, tasks);
+            apply_memory_protection(next);
+            // Safety: this leaks a pointer aliasing next into static
+            // scope, but we won't read it back until the next kernel
+            // entry, so no aliasing/racing.
+            unsafe {
+                set_current_task(next);
+            }
+        }
+    });
+    crate::profiling::event_timer_isr_exit();
+}
+
+/// Delivers a peripheral interrupt to its owning task: mask the source,
+/// post the notification, switch if the scheduler asks. Mirrors arm_m's
+/// DefaultHandler, with the same disable-then-post order -- the task must
+/// re-enable via `sys_irq_control` once it has serviced the device.
+///
+/// # Safety
+///
+/// `task` must be the valid pointer passed in by the trap entry sequence.
+unsafe fn handle_peripheral_irq(task: *mut task::Task, source: u32) {
+    crate::profiling::event_isr_enter();
+    let owner = crate::startup::HUBRIS_IRQ_TASK_LOOKUP
+        .get(InterruptNum(source))
+        .unwrap_or_else(|| panic!("unhandled IRQ {source}"));
+
+    // Safety: dereferencing the trusted task pointer; dropped immediately
+    // so it does not alias the task table below.
+    let idx = unsafe { usize::from((*task).descriptor().index) };
+
+    with_task_table(|tasks| {
+        // Can only fail for an out-of-range source, and this one came from
+        // the chip's own routing table.
+        chip::disable_irq(source, false).ok();
+
+        let n = task::NotificationSet(owner.notification);
+        let switch = tasks[owner.task as usize].post(n);
+        if switch {
+            let next = task::select(idx, tasks);
+            apply_memory_protection(next);
+            // Safety: pointer aliases next in static scope, but it isn't
+            // read back until the next kernel entry.
+            unsafe {
+                set_current_task(next);
+            }
+        }
+    });
+    crate::profiling::event_isr_exit();
 }
 
 /// Records the app's tick divisor under the name arm_m uses, which
