@@ -4,14 +4,40 @@
 
 //! Architecture support for 32-bit RISC-V.
 //!
-//! # Status
+//! # Layout: ISA vs chip
 //!
-//! The context-switch core is implemented: trap entry/exit via `mscratch`,
-//! syscall dispatch, fault delivery, task (re)initialization, and PMP
-//! programming. Still unimplemented (`todo!`): the kernel tick, interrupt
-//! control, software IRQ pending, and reset -- all of which depend on
-//! implementation-chosen hardware rather than on the ISA. **Nothing here
-//! has run on hardware.**
+//! The RISC-V privileged architecture standardizes far less of a working
+//! system than ARMv?-M does. A Cortex-M part comes with its vector table,
+//! NVIC, SysTick and MPU defined by the architecture; a RISC-V
+//! implementation chooses its own interrupt fabric (CLINT, PLIC, CLIC, or
+//! something vendor-specific), its own timer, and its own reset and
+//! bus-protection machinery. So this backend is split in two:
+//!
+//! - **this module**: everything the ISA and the privileged spec pin down --
+//!   the register file and trap entry/exit, syscall and fault dispatch, PMP
+//!   programming, task initialization, timekeeping, and the scheduling glue;
+//! - **`riscv32/chip/<name>.rs`**: everything the implementation chose -- the
+//!   tick timer, interrupt routing and control, any bus-level access gate,
+//!   the coprocessor set, and reset.
+//!
+//! Exactly one chip module is selected by a kernel Cargo feature, named in
+//! the app.toml (`[kernel] features = ["esp32c6"]`). Like the arch modules
+//! themselves (see `arch.rs`), chip modules are duck-typed rather than
+//! implementing a trait: each must export the same set of names. The
+//! required surface is:
+//!
+//! | Name | Kind | Contract |
+//! |---|---|---|
+//! | `PMP_ENTRIES` | `const usize` | PMP entries the core implements and the kernel programs per task: 8 or 16. Must match the `[pmp] entries` the chip description gives the build (checked at compile time) |
+//! | `PMP_GRANULARITY` | `const u32` | smallest NAPOT region the PMP expresses exactly; smaller access-granting regions are rejected at build time |
+//! | `init(tick_divisor)` | `fn` | one-shot hardware init before the first task: bus gates, coprocessor disable, tick timer, interrupt routing. Called with `mstatus.MIE` clear and `mtvec` already installed, so it may unmask interrupt sources freely. |
+//! | `enable_irq` / `disable_irq` / `irq_status` / `pend_software_irq` | `fn` | the kernel's IRQ interface, in Hubris `InterruptNum` numbering |
+//! | `reset()` | `fn -> !` | restart the system |
+//!
+//! One contract item deserves emphasis: `SavedState` below holds only the
+//! integer register file, so `chip::init` **must disable every coprocessor**
+//! whose state a task could otherwise touch (FPU, vendor units). State that
+//! is accessible but not context-switched is silently shared between tasks.
 //!
 //! # How this differs from `arm_m`
 //!
@@ -58,7 +84,7 @@ use crate::startup::with_task_table;
 use crate::task;
 use crate::time::Timestamp;
 use crate::umem::USlice;
-use abi::{FaultInfo, FaultSource, InterruptNum, UsageError};
+use abi::{FaultInfo, FaultSource};
 use unwrap_lite::UnwrapLite;
 
 // The kernel requires an atomic swap operation, abstracted behind
@@ -127,6 +153,29 @@ macro_rules! read_csr {
     }};
 }
 
+// Chip support module selection; see the module docs for the surface each
+// chip module must export. NOTE: the macros above are visible to the chip
+// module because they are defined before it -- keep it that way.
+cfg_if::cfg_if! {
+    if #[cfg(feature = "esp32c6")] {
+        // Note the path is relative to this file's directory (arch/), not
+        // the module's child directory (arch/riscv32/): a #[path] inside a
+        // macro-generated block -- cfg_if! here -- resolves against the file.
+        #[path = "riscv32/chip/esp32c6.rs"]
+        mod chip;
+    } else {
+        compile_error!(
+            "building for riscv32 requires a chip support module; \
+             name its feature in the app.toml, e.g. \
+             [kernel] features = [\"esp32c6\"]"
+        );
+    }
+}
+
+// The chip module implements these directly; they are part of the arch
+// interface the portable kernel consumes.
+pub use chip::{disable_irq, enable_irq, irq_status, pend_software_irq, reset};
+
 /// RISC-V integer registers that must be saved across a context switch.
 ///
 /// Unlike ARMv?-M, the hardware saves nothing on trap entry, so this covers the
@@ -136,27 +185,15 @@ macro_rules! read_csr {
 /// handler spills with a mechanical `sw xN, (N-1)*4(sp)` sweep, so reordering
 /// them for readability would silently corrupt every context switch.
 ///
-/// # UNRESOLVED: coprocessor state is not saved here
+/// # Coprocessor state is deliberately absent
 ///
-/// A RISC-V core may carry state beyond the integer file: the F and D
-/// extensions' floating-point registers, the V extension's vector state, or
-/// vendor-specific units. None of it is in this struct. Two tasks using any
-/// of it would corrupt each other silently.
-///
-/// So one of the following must be made true. Which one is an open decision:
-///
-/// 1. Tasks never touch the coprocessors -- soft-float ABI, no vector or
-///    vendor-unit instructions -- enforced by the `-march`/`-mabi` the build
-///    system passes, *not* by this comment. Then they hold no task state and
-///    this struct is correct as written. This is the Hubris-shaped answer
-///    (static, no per-task allocation), but it is not implemented or enforced
-///    anywhere yet.
-/// 2. This struct grows to cover them, and every context switch pays the cost
-///    unconditionally.
-/// 3. Lazy save on first use: leave `mstatus.FS`/`mstatus.VS` Off, take the
-///    illegal-instruction trap on a task's first use, and save state only
-///    for tasks that touch it. A core whose Off state fails to trap some
-///    instruction would leave a hole in that detection.
+/// Only the integer file is saved. Any coprocessor state a task could reach
+/// (FPU registers, vendor-unit state) would be silently shared across
+/// context switches, so the chip layer is required to disable every
+/// coprocessor before the first task runs -- see the chip surface contract
+/// in the module docs. (Lazy, trap-on-first-use switching was considered
+/// and rejected: it needs a per-task coprocessor save area the kernel
+/// does not have, for a feature no task in this tree uses.)
 ///
 /// # Note on `mstatus`/`mcause`
 ///
@@ -289,33 +326,29 @@ pub struct RegionDescExt {
 /// `2^n` at a naturally aligned base, `pmpaddr = (base >> 2) | ((size >> 3) -
 /// 1)` and `pmpcfg.A = NAPOT`. See the PMP chapter of the privileged spec.
 ///
-/// PMP granularity is implementation-chosen; this encoder assumes 128
-/// bytes, the same placeholder the build system sizes regions to
-/// (build/xtask/src/config.rs `mpu_alignment`). For a NAPOT region smaller
-/// than the granularity, the hardwired low `pmpaddr` bits silently grow it
-/// to the granularity. That is fine for a region granting *no* access (the
-/// 32-byte null region -- growing a deny region denies more, and U-mode has
-/// no default access anyway), but would be a silent protection hole for any
-/// region granting access, so we reject those.
+/// PMP granularity is implementation-chosen, so it comes from the chip module
+/// (`chip::PMP_GRANULARITY`): for a NAPOT region smaller than that, the
+/// hardwired low `pmpaddr` bits silently grow it to the granularity. That is
+/// fine for a region granting *no* access (the 32-byte null region -- growing
+/// a deny region only denies more), but would be a silent protection hole
+/// for any region granting access, so we reject those.
 pub const fn compute_region_extension_data(
     base: u32,
     size: u32,
     attributes: RegionAttributes,
 ) -> RegionDescExt {
-    const GRANULARITY: u32 = 128; // see above
-
-    if size < 8 || !size.is_power_of_two() {
-        panic!("PMP regions must be power-of-two sized, >= 8 bytes");
+    if size < 4 || !size.is_power_of_two() {
+        panic!("PMP regions must be power-of-two sized, >= 4 bytes");
     }
-    if base % size != 0 {
-        panic!("PMP NAPOT regions must be naturally aligned");
+    if !base.is_multiple_of(size) {
+        panic!("PMP regions must be naturally aligned");
     }
 
     let r = attributes.contains(RegionAttributes::READ);
     let w = attributes.contains(RegionAttributes::WRITE);
     let x = attributes.contains(RegionAttributes::EXECUTE);
 
-    if size < GRANULARITY && (r || w || x) {
+    if size < chip::PMP_GRANULARITY && (r || w || x) {
         panic!("region smaller than PMP granularity grants access");
     }
     // The R=0, W=1 combination is reserved by the PMP spec (absent Smepmp
@@ -328,8 +361,17 @@ pub const fn compute_region_extension_data(
     // MPU. The PMP has no equivalent, and neither role grants access, so
     // both are ignored here.
 
-    let pmpaddr = (base >> 2) | ((size >> 3) - 1);
-    let mut pmpcfg: u32 = 0b11 << 3; // A = NAPOT, L = 0 (never locked)
+    // A 4-byte region has no NAPOT encoding (the smallest is 8 bytes);
+    // the spec gives it its own mode, NA4, with pmpaddr the bare address.
+    // Both are usable only when the granularity is 4 (chips with G > 0
+    // hardwire the low pmpaddr bits and NA4 reads back as OFF), which the
+    // granularity check above already guarantees for a 4-byte grant.
+    let (pmpaddr, mode) = if size == 4 {
+        (base >> 2, 0b10) // A = NA4
+    } else {
+        ((base >> 2) | ((size >> 3) - 1), 0b11) // A = NAPOT
+    };
+    let mut pmpcfg: u32 = mode << 3; // L = 0 (never locked)
     if r {
         pmpcfg |= 1 << 0;
     }
@@ -343,17 +385,34 @@ pub const fn compute_region_extension_data(
     RegionDescExt { pmpaddr, pmpcfg }
 }
 
+/// Regions per task: every PMP entry the core implements.
+///
+/// The privileged spec defines 0, 16 or 64 entries architecturally, but an
+/// implementation exposes what it has and hardwires the rest to zero, and
+/// eight is common in small cores (the same budget as the Cortex-M MPU).
+/// The chip module states its count; the build system takes the same
+/// number from the chip description and `descs.rs` checks the two agree.
+pub const REGIONS_PER_TASK: usize = chip::PMP_ENTRIES;
+
+const _: () = assert!(
+    chip::PMP_ENTRIES == 8 || chip::PMP_ENTRIES == 16,
+    "the riscv32 backend programs 8 or 16 PMP entries"
+);
+
 /// Reprograms the PMP for `task`, called on every context switch.
 ///
-/// All eight of a task's regions map to PMP entries 0-7, precomputed at
-/// build time (see [`compute_region_extension_data`]). Entries are never
-/// locked (L=0), and unlocked PMP entries do not apply to M-mode at all --
-/// so the kernel is unaffected by whatever is programmed here, and no
-/// enable/disable dance is needed around the update. U-mode is not running
-/// while we're in here, so transient states are unobservable.
+/// A task's regions map one-to-one onto PMP entries `0..PMP_ENTRIES`,
+/// precomputed at build time (see [`compute_region_extension_data`]).
+/// Entries are never locked (L=0), and unlocked PMP entries do not apply
+/// to M-mode at all -- so the kernel is unaffected by whatever is
+/// programmed here, and no enable/disable dance is needed around the
+/// update. U-mode is not running while we're in here, so transient states
+/// are unobservable.
 pub fn apply_memory_protection(task: &task::Task) {
-    let mut pmpcfg = [0u32; 2];
-    let mut pmpaddr = [0u32; 8];
+    // Sized for the larger configuration; on an 8-entry core the upper
+    // half stays zero and is never written.
+    let mut pmpcfg = [0u32; 4];
+    let mut pmpaddr = [0u32; 16];
     for (i, region) in task.region_table().iter().enumerate() {
         let ext = &region.arch_data;
         pmpaddr[i] = ext.pmpaddr;
@@ -389,6 +448,36 @@ pub fn apply_memory_protection(task: &task::Task) {
             cfg1 = in(reg) pmpcfg[1],
             options(nostack, preserves_flags),
         );
+        // The upper eight exist only on a 16-entry core; on an 8-entry
+        // core the CSRs may be hardwired to zero or absent entirely, and
+        // writing them is at best pointless. Constant condition: the
+        // branch folds away.
+        if chip::PMP_ENTRIES == 16 {
+            core::arch::asm!("
+                csrw pmpaddr8, {addr8}
+                csrw pmpaddr9, {addr9}
+                csrw pmpaddr10, {addr10}
+                csrw pmpaddr11, {addr11}
+                csrw pmpaddr12, {addr12}
+                csrw pmpaddr13, {addr13}
+                csrw pmpaddr14, {addr14}
+                csrw pmpaddr15, {addr15}
+                csrw pmpcfg2, {cfg2}
+                csrw pmpcfg3, {cfg3}
+                ",
+                addr8 = in(reg) pmpaddr[8],
+                addr9 = in(reg) pmpaddr[9],
+                addr10 = in(reg) pmpaddr[10],
+                addr11 = in(reg) pmpaddr[11],
+                addr12 = in(reg) pmpaddr[12],
+                addr13 = in(reg) pmpaddr[13],
+                addr14 = in(reg) pmpaddr[14],
+                addr15 = in(reg) pmpaddr[15],
+                cfg2 = in(reg) pmpcfg[2],
+                cfg3 = in(reg) pmpcfg[3],
+                options(nostack, preserves_flags),
+            );
+        }
     }
 }
 
@@ -456,14 +545,39 @@ pub fn reinitialize(task: &mut task::Task) {
     }
 }
 
-/// Starts the first task. Never returns.
+/// Starts the kernel tick and the first task. Never returns.
 ///
-/// TODO: the kernel tick is not started here yet. The privileged spec
-/// mandates no timer, so the tick source is the implementation's choice
-/// (see `now()`). Until one is wired up the divisor is unused, tasks run
-/// untimed, and timer syscalls panic.
-pub fn start_first_task(_tick_divisor: u32, task: &task::Task) -> ! {
+/// `tick_divisor` is the number of tick-timer input ticks per kernel tick
+/// (1 ms); the app supplies it, since the timer's input frequency is a
+/// board/clock configuration question.
+pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
+    // Take ownership of the trap path before enabling anything that can
+    // raise an interrupt. Two ordering rules, both learned the hard way:
+    // interrupt sources must not be enabled while mtvec still points at
+    // whatever ran before us, and the kernel's non-preemptibility must be
+    // established rather than assumed -- mstatus.MIE is not reliably 0
+    // when the boot ROM hands over, so an already-pending source fires
+    // the instant it is unmasked.
     unsafe {
+        // Name the first task before the trap vector can be reached. The
+        // trap entry spills the register file through mscratch before it
+        // can tell where the trap came from, so mscratch must point at a
+        // save area from the moment mtvec is ours. A kernel fault in the
+        // chip's init is then reported as what it is; through whatever
+        // the boot ROM left in mscratch, the spill itself may fault and
+        // be reported in its place.
+        //
+        // Safety: `task` points into the live task table per our contract.
+        set_current_task(task);
+
+        // Kernel runs with M-mode interrupts off, forever. Tasks get
+        // them because interrupts to a higher privilege mode are always
+        // enabled while running in a lower one.
+        core::arch::asm!(
+            "csrci mstatus, 8", // clear MIE
+            options(nostack, preserves_flags),
+        );
+
         // Install the trap vector, direct mode (the low two bits of mtvec
         // are zero because _hubris_trap_entry is 4-byte aligned and mode
         // Direct is encoding 0): every trap lands at the same entry point.
@@ -472,16 +586,19 @@ pub fn start_first_task(_tick_divisor: u32, task: &task::Task) -> ! {
             in(reg) _hubris_trap_entry as usize,
             options(nostack, preserves_flags),
         );
+    }
 
-        // Safety: `task` points into the live task table per our contract.
-        set_current_task(task);
+    // Chip-level hardware init: bus filters opened for U-mode, coprocessors
+    // disabled, the tick timer programmed and routed. Runs with MIE clear
+    // and our mtvec installed (see above), so it may unmask sources freely.
+    chip::init(tick_divisor);
 
+    unsafe {
         // Enter the task through the same register-restore path every trap
         // exit uses: mstatus.MPP is forced to U and MPIE to 1 there, so the
         // mret at its end is a drop into U-mode at the task's saved pc.
         // Global interrupts in M-mode (mstatus.MIE) remain 0 forever -- the
-        // kernel is not preemptible -- and mie is still in its reset state
-        // (no sources enabled), so U-mode MIE=1 delivers nothing yet.
+        // kernel is not preemptible.
         _hubris_task_return()
     }
 }
@@ -761,9 +878,11 @@ pub fn now() -> Timestamp {
     todo!("tick counter")
 }
 
-/// Records the clock frequency, in kHz, mirroring arm_m: debuggers read
-/// this by symbol, and it is the value the eventual tick setup will
-/// consume.
+/// Records the app's tick divisor under the name arm_m uses, which
+/// debuggers read by symbol. On ARM the divisor is the CPU clock in kHz,
+/// since SysTick counts that clock. Here it is the input rate of the
+/// chip's tick timer in kHz, which need not be the CPU clock; it is the
+/// value the chip's tick setup consumes.
 ///
 /// # Safety
 ///
@@ -777,45 +896,3 @@ pub unsafe fn set_clock_freq(tick_divisor: u32) {
 #[unsafe(no_mangle)]
 static CLOCK_FREQ_KHZ: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
-
-/// Enables interrupt `n`, optionally clearing any pending instance first.
-///
-/// TODO: unimplemented. The interrupt controller is implementation-chosen:
-/// CLINT, PLIC, CLIC or vendor-specific.
-pub fn enable_irq(
-    _n: u32,
-    _also_clear_pending: bool,
-) -> Result<(), UsageError> {
-    todo!("interrupt enable")
-}
-
-/// Disables interrupt `n`, optionally clearing any pending instance.
-///
-/// TODO: unimplemented.
-pub fn disable_irq(
-    _n: u32,
-    _also_clear_pending: bool,
-) -> Result<(), UsageError> {
-    todo!("interrupt disable")
-}
-
-/// Reports whether interrupt `n` is enabled, pending, and/or posted.
-///
-/// TODO: unimplemented.
-pub fn irq_status(_n: u32) -> Result<abi::IrqStatus, UsageError> {
-    todo!("interrupt status")
-}
-
-/// Pends interrupt `n` in software.
-///
-/// TODO: unimplemented.
-pub fn pend_software_irq(_n: InterruptNum) -> Result<(), UsageError> {
-    todo!("interrupt software pend")
-}
-
-/// Resets the chip. Never returns.
-///
-/// TODO: unimplemented.
-pub fn reset() -> ! {
-    todo!("system reset")
-}

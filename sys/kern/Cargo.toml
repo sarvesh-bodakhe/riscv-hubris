@@ -41,6 +41,9 @@ phash-gen = { path = "../../build/phash-gen" }
 [features]
 dump = []
 nano = []
+# RISC-V chip support selection (see src/arch/riscv32.rs): a riscv32
+# build must enable exactly one, via [kernel] features in the app.toml.
+esp32c6 = []
 
 [lib]
 test = false
