@@ -3106,6 +3106,24 @@ pub fn make_kconfig(
     // Pare down the list of shared regions.
     flat_shared.retain(|name, _v| used_shared_regions.contains(name.as_str()));
 
+    // The portable region model explicitly permits overlapping grants
+    // (sys/kern/src/descs.rs: two regions over one area, one read-only
+    // and one read-write), and on the ARM MPU static priority makes that
+    // idiom meaningful. The PMP cannot carry it. By the privileged spec
+    // the lowest-numbered matching entry decides, and the kernel orders
+    // a task's entries by address, so which of two overlapping grants
+    // won would be an accident of their bases. Cores also exist that
+    // ignore the priority and grant an access matching *any* enabled
+    // entry, which resolves the idiom to the union of the permissions.
+    // Rather than audit which cores do what, forbid overlap across the
+    // whole riscv32 backend: no app needs it, and neither outcome is
+    // what anyone meant.
+    if toml.target.starts_with("riscv32") {
+        for (task_name, task) in toml.tasks.keys().zip(&tasks) {
+            check_no_region_overlap(task_name, task, &flat_shared)?;
+        }
+    }
+
     Ok(build_kconfig::KernelConfig {
         features: toml.kernel.features.clone(),
         regions_per_task: toml.regions_per_task(),
@@ -3117,6 +3135,63 @@ pub fn make_kconfig(
         tasks,
         shared_regions: flat_shared,
     })
+}
+
+/// Collects every memory region granted to `task` -- owned allocation
+/// chunks and shared regions alike -- and fails if any two overlap. See
+/// the riscv32 PMP rationale at the call site in `make_kconfig`.
+///
+/// Detection works on spans sorted by start address: if every adjacent
+/// pair is disjoint, transitivity makes the whole set disjoint, so only
+/// neighbors need comparing.
+fn check_no_region_overlap(
+    task_name: &str,
+    task: &build_kconfig::TaskConfig,
+    shared: &BTreeMap<String, build_kconfig::RegionConfig>,
+) -> Result<()> {
+    // (label, start, end), end exclusive. u64 so a region ending at
+    // the top of the 32-bit space doesn't overflow the end computation.
+    let mut spans: Vec<(String, u64, u64)> = vec![];
+    for (out_name, mr) in &task.owned_regions {
+        // Chunks of a multi-region allocation stack contiguously from
+        // the base; the kernel's build script addresses them the same
+        // way (sys/kern/build.rs).
+        let mut base = u64::from(mr.base);
+        for (i, &size) in mr.sizes.iter().enumerate() {
+            spans.push((
+                format!("{out_name}.{i}"),
+                base,
+                base + u64::from(size),
+            ));
+            base += u64::from(size);
+        }
+    }
+    for name in &task.shared_regions {
+        let r = &shared[name];
+        let base = u64::from(r.base);
+        spans.push((name.clone(), base, base + u64::from(r.size)));
+    }
+    spans.retain(|s| s.1 != s.2);
+    spans.sort_by_key(|s| s.1);
+    for pair in spans.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if b.1 < a.2 {
+            bail!(
+                "task {task_name}: memory regions '{}' ({:#x}..{:#x}) and \
+                 '{}' ({:#x}..{:#x}) overlap. The PMP has no region \
+                 priority and an implementation may grant an access that \
+                 matches any enabled entry, so overlapping grants are not \
+                 allowed on riscv32 targets",
+                a.0,
+                a.1,
+                a.2,
+                b.0,
+                b.1,
+                b.2
+            );
+        }
+    }
+    Ok(())
 }
 
 fn get_elf_entry_point(input: &Path) -> Result<u32> {
