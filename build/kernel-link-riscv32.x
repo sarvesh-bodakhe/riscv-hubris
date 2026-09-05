@@ -3,9 +3,11 @@
    Derived from kernel-link.x with the Cortex-M machinery removed: RISC-V has
    no hardware vector table (the trap vector, mtvec, is programmed at
    runtime), and we do not use cortex-m-rt or an equivalent runtime crate.
-   The kernel entry point is a hand-written `_start` provided by the app
-   crate, placed first in .text so it sits at a known offset right after the
-   image header.
+   The kernel entry point is a hand-written `_start` in the kernel's
+   riscv32 arch layer, placed at the very start of the image: a reset
+   vector that jumps to the image base (a bare core's reset address)
+   lands on it, and a loader that honours the ELF entry point finds the
+   same place. The image header follows at its alignment.
 */
 
 INCLUDE memory.x
@@ -16,30 +18,32 @@ SECTIONS
 {
   PROVIDE(_stack_start = ORIGIN(STACK) + LENGTH(STACK));
 
+  /* ### .text, opening with the entry routine: the first instruction of
+     the image. (One executable section, not an entry section plus .text:
+     Humility locates every function relative to the section named .text.) */
+  .text ORIGIN(FLASH) :
+  {
+    __stext = .;
+    KEEP(*(.text.start*)); /* the _start routine, first */
+    *(.text .text.*);
+    . = ALIGN(4);
+    __etext = .;
+  } > FLASH
+
   /* Header containing data needed by the loader. We specify
      _HUBRIS_IMAGE_HEADER_SIZE and _HUBRIS_IMAGE_HEADER_ALIGN in memory.x at
      build time, then reserve enough space for the header here. There is no
-     vector table on RISC-V, so the header sits at the very start of the
-     image and code follows it. */
-  .header ORIGIN(FLASH) :
+     vector table on RISC-V; the header follows the code, at its alignment,
+     and is located by section name. */
+  .header ALIGN(_HUBRIS_IMAGE_HEADER_ALIGN) :
   {
     ASSERT(. == ALIGN(_HUBRIS_IMAGE_HEADER_ALIGN), "error: header alignment is invalid");
     HEADER = .;
     . = . + _HUBRIS_IMAGE_HEADER_SIZE;
   } > FLASH
 
-  /* ### .text */
-  .text : ALIGN(4)
-  {
-    __stext = .;
-    *(.text.start*); /* pull the _start routine to the beginning */
-    *(.text .text.*);
-    . = ALIGN(4);
-    __etext = .;
-  } > FLASH
-
   /* ### .rodata */
-  .rodata __etext : ALIGN(4)
+  .rodata : ALIGN(4)
   {
     __srodata = .;
     *(.rodata .rodata.*);

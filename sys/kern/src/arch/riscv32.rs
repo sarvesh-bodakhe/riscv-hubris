@@ -662,9 +662,10 @@ pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
     // raise an interrupt. Two ordering rules, both learned the hard way:
     // interrupt sources must not be enabled while mtvec still points at
     // whatever ran before us, and the kernel's non-preemptibility must be
-    // established rather than assumed -- mstatus.MIE is not reliably 0
-    // when the boot ROM hands over, so an already-pending source fires
-    // the instant it is unmasked.
+    // established rather than assumed. `_start` has cleared mstatus.MIE
+    // with its first instruction: the kernel runs with M-mode interrupts
+    // off, forever, and tasks get them because interrupts to a higher
+    // privilege mode are always enabled while running in a lower one.
     unsafe {
         // Name the first task before the trap vector can be reached. The
         // trap entry spills the register file through mscratch before it
@@ -676,14 +677,6 @@ pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
         //
         // Safety: `task` points into the live task table per our contract.
         set_current_task(task);
-
-        // Kernel runs with M-mode interrupts off, forever. Tasks get
-        // them because interrupts to a higher privilege mode are always
-        // enabled while running in a lower one.
-        core::arch::asm!(
-            "csrci mstatus, 8", // clear MIE
-            options(nostack, preserves_flags),
-        );
 
         // Install the trap vector: _hubris_trap_entry is a 32-slot jump
         // table (see its comments) covering direct, vectored and CLIC
@@ -755,6 +748,63 @@ unsafe extern "C" {
     /// [`start_first_task`].
     fn _hubris_task_return() -> !;
 }
+
+// The kernel entry point: the image's first instruction.
+//
+// ARM images get this from cortex-m-rt. Here it is the minimal work such a
+// runtime does -- set up gp and sp, copy .data, zero .bss -- before calling
+// the app's `main`, which picks the tick divisor and enters
+// `startup::start_kernel`. Every symbol it uses is defined by
+// build/kernel-link-riscv32.x, which also places .text.start at the image
+// base: both a reset vector that jumps there and a loader that honours the
+// ELF entry point land on it.
+core::arch::global_asm!(
+    "
+    .section .text.start, \"ax\"
+    .global _start
+    .type _start, @function
+_start:
+    # Machine interrupts off, before anything else. The kernel is never
+    # preempted, and mstatus.MIE is not reliably 0 when a boot ROM hands
+    # over: a source it left enabled and pending would otherwise be
+    # taken into the ROM's own trap vector while the kernel starts up.
+    csrci mstatus, 8
+
+    # Set up the global pointer, with linker relaxation off so this
+    # instruction itself is not turned into a gp-relative no-op.
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+
+    # Kernel stack.
+    la sp, _stack_start
+
+    # Copy .data from its load address to its run address.
+    la a0, __edata
+    la a1, __sidata
+    la a2, __sdata
+    j 1f
+2:  lw a3, 0(a1)
+    addi a1, a1, 4
+    sw a3, 0(a2)
+    addi a2, a2, 4
+1:  bne a2, a0, 2b
+
+    # Zero .bss.
+    la a0, __ebss
+    la a1, __sbss
+    j 1f
+2:  sw zero, 0(a1)
+    addi a1, a1, 4
+1:  bne a1, a0, 2b
+
+    call main
+
+    # Trap if the kernel entry somehow returns.
+    unimp
+    "
+);
 
 // The trap entry/exit path.
 //
