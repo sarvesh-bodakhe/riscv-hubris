@@ -391,6 +391,10 @@ pub struct RegionDescExt {
     rasr: u32,
 }
 
+/// Regions per task: the MPU programs eight entries (null region plus
+/// seven grants).
+pub const REGIONS_PER_TASK: usize = 8;
+
 #[cfg(any(armv6m, armv7m))]
 pub const fn compute_region_extension_data(
     base: u32,

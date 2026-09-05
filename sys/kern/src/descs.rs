@@ -4,7 +4,18 @@
 
 //! Descriptor types, used to statically define application resources.
 
-pub(crate) const REGIONS_PER_TASK: usize = 8;
+/// How many memory regions a task may hold: the number of protection
+/// entries the architecture programs per task (see `arch`).
+pub(crate) const REGIONS_PER_TASK: usize = crate::arch::REGIONS_PER_TASK;
+
+// The build system laid every task's region table out at the width it
+// took from the chip description (`regions_per_task` in the kconfig);
+// the arch backend programs the width its own constant says. Nothing
+// works unless they agree, so check it here, where both are visible.
+const _: () = assert!(
+    REGIONS_PER_TASK == crate::startup::HUBRIS_REGIONS_PER_TASK,
+    "the arch backend's REGIONS_PER_TASK disagrees with the build's regions_per_task"
+);
 
 /// Indicates priority of a task.
 ///

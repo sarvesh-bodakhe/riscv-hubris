@@ -33,6 +33,7 @@ struct Generated {
     tasks: Vec<TokenStream>,
     regions: Vec<TokenStream>,
     irq_code: TokenStream,
+    regions_per_task: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -125,6 +126,10 @@ fn process_config() -> Result<Generated> {
 
     for (i, task) in kconfig.tasks.iter().enumerate() {
         // Work out the region indices for each of this task's regions.
+        // The table is as wide as the target has protection entries; the
+        // build system took the number from the chip description and the
+        // kernel checks it against its arch backend (descs.rs).
+        let regions_per_task = kconfig.regions_per_task;
         let mut regions = vec![
             // Always include the null region.
             region_table.get_index_of(&RegionKey::Null).unwrap(),
@@ -154,10 +159,21 @@ fn process_config() -> Result<Generated> {
             );
         }
 
-        if regions.len() > 8 {
-            bail!("too many regions ({}) for task {i}", regions.len());
+        if regions.len() > regions_per_task {
+            // Name them: which memory chunks and grants are being
+            // counted is what someone reshaping an app.toml needs.
+            let mut what = vec![];
+            for (name, region) in &task.owned_regions {
+                what.push(format!("{name} x{}", region.sizes.len()));
+            }
+            what.extend(task.shared_regions.iter().cloned());
+            bail!(
+                "too many regions ({}) for task {i}, max {regions_per_task}: {}",
+                regions.len(),
+                what.join(", ")
+            );
         }
-        regions.resize(8, 0usize);
+        regions.resize(regions_per_task, 0usize);
 
         // Order the task's regions in ascending address order.
         //
@@ -336,6 +352,7 @@ fn process_config() -> Result<Generated> {
         tasks: task_descs,
         regions: region_descs,
         irq_code,
+        regions_per_task: kconfig.regions_per_task,
     })
 }
 
@@ -463,6 +480,19 @@ fn generate_statics(generated: &Generated) -> Result<()> {
             static HUBRIS_REGION_DESCS: [RegionDesc; #region_count] = [
                 #(#regions,)*
             ];
+        },
+    )?;
+
+    /////////////////////////////////////////////////////////
+    // Region table width, for the kernel to check against its arch
+    // backend (see descs.rs).
+
+    let regions_per_task = generated.regions_per_task;
+    writeln!(
+        file,
+        "{}",
+        quote::quote! {
+            pub(crate) const HUBRIS_REGIONS_PER_TASK: usize = #regions_per_task;
         },
     )?;
 

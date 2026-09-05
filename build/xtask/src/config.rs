@@ -80,6 +80,9 @@ pub struct Config {
     pub outputs: IndexMap<String, Vec<Output>>,
     pub tasks: IndexMap<String, Task>,
     pub peripherals: IndexMap<String, Peripheral>,
+    /// The chip's PMP parameters, from `[pmp]` in its chip.toml; present
+    /// on every riscv32 target, absent on ARM (the MPU is architectural).
+    pub pmp: Option<PmpConfig>,
     pub extratext: IndexMap<String, Peripheral>,
     pub config: Option<ordered_toml::Value>,
     pub buildhash: u64,
@@ -146,13 +149,22 @@ impl Config {
         // The app.toml must include a `chip` key, which defines the peripheral
         // register map in a separate file.  We load it then accumulate that
         // file in the buildhash.
-        let mut peripherals: IndexMap<String, Peripheral> = {
+        let (pmp, mut peripherals) = {
             let chip_file =
                 cfg.parent().unwrap().join(&toml.chip).join("chip.toml");
             let chip_contents = std::fs::read(chip_file)?;
             hasher.write(&chip_contents);
-            toml::from_str(std::str::from_utf8(&chip_contents)?)?
+            let chip: ChipFile =
+                toml::from_str(std::str::from_utf8(&chip_contents)?)?;
+            (chip.pmp, chip.peripherals)
         };
+        if toml.target.starts_with("riscv32") && pmp.is_none() {
+            bail!(
+                "chip '{}' is built for a riscv32 target and must declare \
+                 its PMP in chip.toml: [pmp] entries = N, granularity = G",
+                toml.chip
+            );
+        }
 
         // The manifest may also include a `mmio` key, which defines extra
         // memory-mapped peripherals attached over a memory bus
@@ -305,6 +317,7 @@ impl Config {
             outputs,
             tasks,
             peripherals,
+            pmp,
             extratext: toml.extratext,
             config: toml.config,
             auxflash,
@@ -408,22 +421,46 @@ impl Config {
     }
 
     fn mpu_alignment(&self) -> MpuAlignment {
-        // ARMv6-M and ARMv7-M require that memory regions be a power of two.
-        // ARMv8-M does not. RISC-V PMP regions use NAPOT encoding
-        // (naturally-aligned power of two), matching the v7-M rules.
+        // ARMv6-M and ARMv7-M require that memory regions be a power of two
+        // (minimum size 32). ARMv8-M does not. RISC-V PMP regions use NAPOT
+        // encoding (naturally-aligned power of two), matching the v7-M
+        // rules; the minimum is the PMP granularity, which the privileged
+        // spec leaves to the implementation, so the chip description
+        // states it.
         match self.target.as_str() {
             "thumbv8m.main-none-eabihf" => MpuAlignment::Chunk(32),
             "thumbv7em-none-eabihf" | "thumbv6m-none-eabi" => {
-                MpuAlignment::PowerOfTwo
+                MpuAlignment::PowerOfTwo(32)
             }
-            t if t.starts_with("riscv32") => MpuAlignment::PowerOfTwo,
+            t if t.starts_with("riscv32") => {
+                MpuAlignment::PowerOfTwo(u64::from(self.pmp().granularity))
+            }
             t => panic!("Unknown mpu requirements for target '{t}'"),
+        }
+    }
+
+    /// The chip's PMP parameters. Only meaningful on riscv32 targets, where
+    /// `from_file` has already insisted they be declared.
+    fn pmp(&self) -> &PmpConfig {
+        self.pmp.as_ref().unwrap_or_else(|| {
+            panic!("chip '{}' declares no [pmp] in its chip.toml", self.chip)
+        })
+    }
+
+    /// Memory protection entries the kernel programs per task: the MPU's
+    /// eight on ARM (one of which the kernel spends on the null region),
+    /// every PMP entry the chip declares on RISC-V.
+    pub fn regions_per_task(&self) -> usize {
+        if self.target.starts_with("riscv32") {
+            self.pmp().entries
+        } else {
+            8
         }
     }
 
     /// Checks whether the given chip's MPU requires power-of-two sized regions
     pub fn mpu_power_of_two_required(&self) -> bool {
-        self.mpu_alignment() == MpuAlignment::PowerOfTwo
+        matches!(self.mpu_alignment(), MpuAlignment::PowerOfTwo(_))
     }
 
     /// Suggests an appropriate size for the given task (or "kernel"), given
@@ -527,8 +564,9 @@ impl Config {
 /// Represents an MPU's desired alignment strategy
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum MpuAlignment {
-    /// Regions should be power-of-two sized and aligned
-    PowerOfTwo,
+    /// Regions should be power-of-two sized and aligned, no smaller than the
+    /// given minimum (the protection unit's granularity)
+    PowerOfTwo(u64),
     /// Regions should be aligned to chunks with a particular granularity
     Chunk(u64),
 }
@@ -544,12 +582,11 @@ impl MpuAlignment {
         regions: usize,
     ) -> VecDeque<u64> {
         match self {
-            MpuAlignment::PowerOfTwo => {
-                const MIN_MPU_REGION_SIZE: u64 = 32;
+            MpuAlignment::PowerOfTwo(min_region_size) => {
+                let min_region_size = *min_region_size;
                 let mut out = VecDeque::new();
                 for _ in 0..regions {
-                    let s =
-                        (size.next_power_of_two() / 2).max(MIN_MPU_REGION_SIZE);
+                    let s = (size.next_power_of_two() / 2).max(min_region_size);
                     out.push_back(s);
                     size = size.saturating_sub(s);
                     if size == 0 {
@@ -577,7 +614,7 @@ impl MpuAlignment {
                 // regions as we can fit.  This doesn't change total size, but
                 // can make alignment more flexible, since smaller regions have
                 // less stringent alignment requirements.
-                while out[0] > MIN_MPU_REGION_SIZE {
+                while out[0] > min_region_size {
                     let largest = out[0];
                     let n = out.iter().filter(|c| **c == largest).count();
                     if out.len() + n > regions {
@@ -602,7 +639,7 @@ impl MpuAlignment {
     /// Returns the desired alignment for a region of a particular size
     fn memory_region_alignment(&self, size: u32) -> u32 {
         match self {
-            MpuAlignment::PowerOfTwo => {
+            MpuAlignment::PowerOfTwo(_) => {
                 assert!(size.is_power_of_two());
                 size
             }
@@ -659,6 +696,34 @@ pub struct Output {
     pub execute: bool,
     #[serde(default)]
     pub dma: bool,
+}
+
+/// The chip description, `chips/<chip>/chip.toml`: the peripheral map,
+/// plus the parameters of a protection unit the architecture leaves to
+/// the implementation. (No `deny_unknown_fields`: serde cannot combine it
+/// with `flatten`; `Peripheral` denies its own.)
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ChipFile {
+    #[serde(default)]
+    pmp: Option<PmpConfig>,
+    #[serde(flatten)]
+    peripherals: IndexMap<String, Peripheral>,
+}
+
+/// A RISC-V chip's PMP, from `[pmp]` in its chip.toml. The privileged spec
+/// fixes neither number: an implementation exposes the entries it has and
+/// hardwires the rest, and its granularity is whatever its address
+/// registers can encode.
+#[derive(Copy, Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PmpConfig {
+    /// Entries the core implements; the kernel programs all of them for
+    /// every task, so this is also a task's region budget.
+    pub entries: usize,
+    /// Smallest region the PMP expresses exactly, in bytes. Regions that
+    /// grant access are rounded up to it by the allocator.
+    pub granularity: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

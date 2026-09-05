@@ -399,7 +399,9 @@ pub const fn compute_region_extension_data(
     RegionDescExt { pmpaddr, pmpcfg }
 }
 
-/// Regions per task: every PMP entry the core implements.
+/// Regions per task: every PMP entry the core implements. A task's table
+/// holds its grants and the null region, as on the Cortex-M MPU, and the
+/// padding the kernel's own entries replace.
 ///
 /// The privileged spec defines 0, 16 or 64 entries architecturally, but an
 /// implementation exposes what it has and hardwires the rest to zero, and

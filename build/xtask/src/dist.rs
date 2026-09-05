@@ -677,7 +677,11 @@ pub fn package(
         })
         .collect::<Result<_, _>>()?;
 
-    // Build a set of requests for the memory allocator
+    // Build a set of requests for the memory allocator.
+    //
+    // Regions a task may own: the protection entries the kernel programs
+    // per task, less the null region every task carries.
+    let budget: usize = cfg.toml.regions_per_task() - 1;
     let mut task_reqs = HashMap::new();
     for (t, sz) in task_sizes {
         let n = sz.len()
@@ -693,12 +697,17 @@ pub fn package(
                 .as_ref()
                 .map(|c| c.tasks.contains(&t.to_string()))
                 .unwrap_or(false) as usize;
-
+        if n > budget {
+            bail!(
+                "task {t} needs {n} memory protection regions (memories, \
+                 extern-regions and uses), more than the {budget} available"
+            );
+        }
         task_reqs.insert(
             t,
             TaskRequest {
                 memory: sz,
-                spare_regions: 7 - n,
+                spare_regions: budget - n,
             },
         );
     }
@@ -2993,6 +3002,7 @@ pub fn make_kconfig(
 
     Ok(build_kconfig::KernelConfig {
         features: toml.kernel.features.clone(),
+        regions_per_task: toml.regions_per_task(),
         extern_regions: toml
             .kernel_extern_regions(image_name)?
             .into_iter()

@@ -24,6 +24,14 @@ pub struct KernelConfig {
 
     /// Interrupts hooked by the application, keyed by IRQ number.
     pub irqs: BTreeMap<u32, InterruptConfig>,
+
+    /// Memory protection entries the target programs per task: the MPU's
+    /// eight on ARM, the PMP entry count the chip description declares on
+    /// RISC-V, the null region included in both. The kernel's build
+    /// script lays each task's region table out at this width, and the
+    /// kernel checks it against its arch backend's own constant at
+    /// compile time.
+    pub regions_per_task: usize,
 }
 
 /// Configuration for a single hooked interrupt.
