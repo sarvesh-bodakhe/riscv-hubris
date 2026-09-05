@@ -433,7 +433,13 @@ impl Config {
                 MpuAlignment::PowerOfTwo(32)
             }
             t if t.starts_with("riscv32") => {
-                MpuAlignment::PowerOfTwo(u64::from(self.pmp().granularity))
+                // The floor is the granularity, but never below the 32
+                // bytes the ARM MPU imposes: the allocator's chunking
+                // logic (and its sanity checks) assume that minimum, and
+                // a smaller chunk is never worth a protection entry.
+                MpuAlignment::PowerOfTwo(u64::from(
+                    self.pmp().granularity.max(32),
+                ))
             }
             t => panic!("Unknown mpu requirements for target '{t}'"),
         }

@@ -2578,8 +2578,23 @@ pub fn allocate_all(
             // We evenly divide spare regions between RAM and flash, rounding up
             // to give flash the extra (if there's an odd number).  This isn't a
             // particularly fancy heuristic, but works fine for our images.
-            let flash_bonus = req.spare_regions.div_ceil(2);
-            let ram_bonus = req.spare_regions - flash_bonus;
+            // Spare protection entries let a memory be split into more
+            // chunks for tighter packing. On riscv32 a task's code is
+            // kept to one chunk: the PMP faults any access that is not
+            // wholly inside a single entry (the privileged spec requires
+            // an entry to match every byte of an access), and with the
+            // compressed extension an instruction fetch can straddle any
+            // 4-byte boundary -- so a seam between two code chunks is a
+            // fault waiting for the linker to place an instruction
+            // across it. RAM takes every spare entry instead: its
+            // accesses are naturally aligned and cannot straddle a chunk.
+            let (flash_bonus, ram_bonus) = if toml.target.starts_with("riscv32")
+            {
+                (0, req.spare_regions)
+            } else {
+                let flash_bonus = req.spare_regions.div_ceil(2);
+                (flash_bonus, req.spare_regions - flash_bonus)
+            };
             let ram_region = toml.task_ram_region(name);
             for (&mem, &amt) in req.memory.iter() {
                 let n = if mem == "flash" {
