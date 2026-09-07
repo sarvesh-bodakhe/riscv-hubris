@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 cfg-if = { workspace = true }
-cortex-m = { workspace = true }
 num-traits = { workspace = true }
 zerocopy = { workspace = true }
 zerocopy-derive = { workspace = true }
@@ -19,6 +18,10 @@ ringbuf = { path = "../../lib/ringbuf" }
 # Some tests require talking to I2C devices on the target board
 drv-i2c-api = { path = "../../drv/i2c-api", optional = true }
 drv-i2c-devices = {  path = "../../drv/i2c-devices", optional = true }
+
+# Only the ARM builds use it; the riscv32 targets cannot compile it.
+[target.'cfg(target_arch = "arm")'.dependencies]
+cortex-m = { workspace = true }
 
 [build-dependencies]
 build-util = { path = "../../build/util" }

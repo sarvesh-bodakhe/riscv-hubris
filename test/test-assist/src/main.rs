@@ -35,21 +35,29 @@ fn stackblow(_arg: u32) {
 
 #[inline(never)]
 fn execdata(_arg: u32) {
-    unsafe {
-        let c = [0x4770u16]; // bx lr
+    // A return instruction in a stack array: executable in neither
+    // instruction set from there, since the stack is not executable.
+    #[cfg(target_arch = "arm")]
+    let c = [0x4770u16]; // bx lr
+    #[cfg(target_arch = "riscv32")]
+    let c = [0x8082u16]; // c.jr ra
 
-        let mut val: u32 = core::mem::transmute(&c);
+    unsafe {
+        let val: u32 = core::mem::transmute(&c);
 
         // set the Thumb bit
-        val |= 1;
+        #[cfg(target_arch = "arm")]
+        let val = val | 1;
 
         let f: extern "C" fn(&[u16]) = core::mem::transmute(val);
         f(&c);
     }
 }
 
+#[cfg(target_arch = "arm")]
 static BXLR: [u16; 1] = [0x4770u16];
 
+#[cfg(target_arch = "arm")]
 #[inline(never)]
 fn illop(_arg: u32) {
     unsafe {
@@ -60,11 +68,33 @@ fn illop(_arg: u32) {
     }
 }
 
+#[cfg(target_arch = "riscv32")]
+#[inline(never)]
+fn illop(_arg: u32) {
+    unsafe {
+        // A breakpoint trap from a task, which the kernel reports as an
+        // invalid operation: the nearest thing RISC-V has to executing
+        // in the wrong instruction set.
+        asm!("ebreak");
+    }
+}
+
+#[cfg(target_arch = "arm")]
 #[inline(never)]
 fn badexec(arg: u32) {
     unsafe {
         let val: u32 = arg | 1;
         let f: extern "C" fn() = core::mem::transmute(val);
+        f();
+    }
+}
+
+#[cfg(target_arch = "riscv32")]
+#[inline(never)]
+fn badexec(arg: u32) {
+    unsafe {
+        // No Thumb bit to set: jump to the address as it is.
+        let f: extern "C" fn() = core::mem::transmute(arg);
         f();
     }
 }
@@ -102,7 +132,9 @@ fn stackoob(_arg: u32) {
 #[inline(never)]
 fn busfault(_arg: u32) {
     unsafe {
-        // unprivileged software reading CSFR is a bus error
+        // unprivileged software reading CSFR is a bus error (on ARM; on
+        // RISC-V the same read of an address nobody answers is an access
+        // fault, which the suite accepts there)
         (0xe000ed28 as *const u32).read_volatile();
     }
 }
@@ -111,7 +143,10 @@ fn busfault(_arg: u32) {
 fn illinst(_arg: u32) {
     unsafe {
         // an illegal instruction
+        #[cfg(target_arch = "arm")]
         asm!("udf 0xde");
+        #[cfg(target_arch = "riscv32")]
+        asm!("unimp");
     }
 }
 

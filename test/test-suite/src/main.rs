@@ -383,6 +383,10 @@ fn test_fault_buserror() {
         FaultInfo::BusError { .. } => {}
         #[cfg(armv6m)]
         FaultInfo::InvalidOperation(_) => {}
+        // RISC-V has no separate bus error: an address nobody answers
+        // raises the same access fault a PMP denial does.
+        #[cfg(target_arch = "riscv32")]
+        FaultInfo::MemoryAccess { .. } => {}
         _ => {
             panic!("expected BusFault; found {:?}", fault);
         }
