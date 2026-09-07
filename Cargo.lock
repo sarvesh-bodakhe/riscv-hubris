@@ -3239,6 +3239,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp32c6"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a207a5d6886ca89b4f220606dcf3779ca869803df192508314939186ae8de1ee"
+dependencies = [
+ "vcell",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4042,6 +4051,7 @@ dependencies = [
  "call_rustfmt",
  "cfg-if",
  "cortex-m",
+ "esp32c6",
  "indexmap 1.9.1",
  "kerncore",
  "phash",

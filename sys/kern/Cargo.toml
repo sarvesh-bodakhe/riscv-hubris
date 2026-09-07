@@ -17,6 +17,9 @@ phash = { path = "../../lib/phash" }
 unwrap-lite = { path = "../../lib/unwrap-lite" }
 kerncore.path = "../kerncore"
 
+# Chip PACs, pulled in only by the matching chip feature below.
+esp32c6 = { workspace = true, optional = true }
+
 # These crates contain ARM inline assembly and only build for ARM targets;
 # they are only used from arch/arm_m.rs.
 [target.'cfg(target_arch = "arm")'.dependencies]
@@ -43,7 +46,7 @@ dump = []
 nano = []
 # RISC-V chip support selection (see src/arch/riscv32.rs): a riscv32
 # build must enable exactly one, via [kernel] features in the app.toml.
-esp32c6 = []
+esp32c6 = ["dep:esp32c6"]
 
 [lib]
 test = false

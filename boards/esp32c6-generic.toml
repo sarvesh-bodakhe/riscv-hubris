@@ -1,0 +1,6 @@
+# esp32c6 devkit, minimal.
+
+# probe-rs knows the chip by this name; this section exists to put it
+# into the archive's flash.ron for debuggers.
+[probe-rs]
+chip-name = "esp32c6"

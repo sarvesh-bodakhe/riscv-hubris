@@ -1,0 +1,14 @@
+# ESP32-C6, minimal: the console UART only. Addresses from public
+# esp-idf components/soc/esp32c6 (register/soc/reg_base.h), interrupt
+# source numbers from include/soc/interrupts.h -- the source number, not
+# a CPU line, is what Hubris records (see the chip module).
+
+# `SOC_CPU_PMP_REGION_GRANULARITY` is 4 on this chip; sixteen entries.
+[pmp]
+entries = 16
+granularity = 4
+
+[uart0]
+address = 0x60000000
+size = 4096
+interrupts = { irq = 43 }
