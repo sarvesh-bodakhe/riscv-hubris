@@ -1,0 +1,73 @@
+# The upstream test suite on the ESP32-C6: the same tasks and layout as
+# test/tests-stm32g0, with the suite's test interrupt bound to one of the
+# chip's software-raised sources.
+
+name = "tests-esp32c6"
+target = "riscv32imac-unknown-none-elf"
+board = "esp32c6-generic"
+chip = "../../chips/esp32c6"
+
+[kernel]
+name = "tests-esp32c6"
+requires = {flash = 32768, ram = 8192}
+features = ["esp32c6"]
+stacksize = 2048
+
+[tasks.runner]
+name = "test-runner"
+priority = 0
+max-sizes = {flash = 16384, ram = 4096}
+start = true
+stacksize = 1904
+
+[tasks.suite]
+name = "test-suite"
+priority = 2
+max-sizes = {flash = 65536, ram = 4096}
+start = true
+task-slots = ["assist", "idol", "suite", "runner"]
+stacksize = 1504
+# The suite exercises interrupt delivery on a source the kernel can raise
+# from software: FROM_CPU_INTR0, one of the four the chip provides. The
+# task only binds the interrupt. The kernel raises and withdraws it, so
+# the task needs no grant of the register block.
+notifications = ["test-irq"]
+interrupts = {"intpri.from-cpu0" = "test-irq"}
+
+# This block is used to test the task_config macro
+[tasks.suite.config]
+foo = '"Hello, world"'
+bar = 42
+baz = [1, 2, 3, 4]
+tup = [[1, true], [2, true], [3, false]]
+
+[tasks.assist]
+name = "test-assist"
+priority = 1
+max-sizes = {flash = 16384, ram = 2048}
+start = true
+stacksize = 1504
+
+[tasks.idol]
+name = "test-idol-server"
+priority = 1
+max-sizes = {flash = 4096, ram = 1024}
+stacksize = 1024
+start = true
+
+[tasks.hiffy]
+name = "task-hiffy"
+priority = 3
+features = ["testsuite"]
+max-sizes = {flash = 32768, ram = 32768 }
+stacksize = 2048
+start = true
+task-slots = ["suite", "runner"]
+notifications = ["timer"]
+
+[tasks.idle]
+name = "task-idle"
+priority = 4
+max-sizes = {flash = 256, ram = 256}
+stacksize = 256
+start = true

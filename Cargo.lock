@@ -7283,6 +7283,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tests-esp32c6"
+version = "0.1.0"
+dependencies = [
+ "kern",
+]
+
+[[package]]
 name = "tests-gemini-bu"
 version = "0.1.0"
 dependencies = [
