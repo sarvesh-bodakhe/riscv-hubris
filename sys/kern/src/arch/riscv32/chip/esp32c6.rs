@@ -70,6 +70,7 @@ register_blocks! {
     systimer: SYSTIMER, systimer;
     plic_mx: PLIC_MX, plic_mx;
     intmtx: INTERRUPT_CORE0, interrupt_core0;
+    intpri: INTPRI, intpri;
     lp_aon: LP_AON, lp_aon;
 }
 
@@ -273,10 +274,33 @@ pub(super) fn decode_interrupt(mcause: u32) -> Option<InterruptEvent> {
     if (line as usize) < CPU_INT_LINES {
         let source = IRQ_LINE_SOURCES[line as usize].load(Ordering::Relaxed);
         if source != NO_SOURCE {
+            // A software-raised source is level-triggered and stays
+            // asserted until written back down; taking it clears it,
+            // as an NVIC clears a pended interrupt on entry.
+            if let Some(reg) = from_cpu_reg(source) {
+                reg.write(|w| w.cpu_intr().clear_bit());
+            }
             return Some(InterruptEvent::Peripheral(source));
         }
     }
     None
+}
+
+/// The four software-raised interrupt sources, FROM_CPU_INTR0..3
+/// (soc/interrupts.h), asserted by writing 1 to their INTPRI register
+/// and withdrawn by writing 0 (intpri_reg.h: CPU_INTR_FROM_CPU_0..3).
+/// Level sources on the matrix like any other; what makes them software
+/// interrupts is that the CPU owns the source.
+const FROM_CPU_FIRST_SOURCE: u32 = 22;
+const FROM_CPU_COUNT: u32 = 4;
+
+fn from_cpu_reg(
+    source: u32,
+) -> Option<&'static pac::intpri::CPU_INTR_FROM_CPU> {
+    source
+        .checked_sub(FROM_CPU_FIRST_SOURCE)
+        .filter(|&i| i < FROM_CPU_COUNT)
+        .map(|i| intpri().cpu_intr_from_cpu(i as usize))
 }
 
 /// Clears the tick interrupt at its source. The PLIC pending state for a
@@ -468,8 +492,11 @@ fn line_for_source(source: u32) -> Result<u32, UsageError> {
 /// nothing to clear for a level-triggered line -- pending follows the
 /// source -- and every line this kernel routes is level-triggered, so it
 /// is accepted and ignored.
-pub fn enable_irq(n: u32, _also_clear_pending: bool) -> Result<(), UsageError> {
+pub fn enable_irq(n: u32, also_clear_pending: bool) -> Result<(), UsageError> {
     let line = line_for_source(n)?;
+    if also_clear_pending && let Some(reg) = from_cpu_reg(n) {
+        reg.write(|w| w.cpu_intr().clear_bit());
+    }
     mie_set(1 << line);
     plic_enable_modify(|en| en | (1 << line));
     Ok(())
@@ -495,24 +522,35 @@ pub fn irq_status(n: u32) -> Result<abi::IrqStatus, UsageError> {
         plic_mx().mxint_enable().read().cpu_mxint_enable().bits() & (1 << line)
             != 0,
     );
-    status.set(
-        abi::IrqStatus::PENDING,
-        plic_mx().emip_status().read().cpu_eip_status().bits() & (1 << line)
-            != 0,
-    );
+    // A software source's pending state is its own register; the line's
+    // EIP bit only reports a source the line is enabled for.
+    let pending = match from_cpu_reg(n) {
+        Some(reg) => reg.read().cpu_intr().bit_is_set(),
+        None => {
+            plic_mx().emip_status().read().cpu_eip_status().bits() & (1 << line)
+                != 0
+        }
+    };
+    status.set(abi::IrqStatus::PENDING, pending);
     Ok(status)
 }
 
-/// Pends interrupt `n` in software -- which this controller cannot do: the
-/// PLIC's pending state is read-only (EIP) for level inputs and its CLEAR
-/// register only clears edges; there is no set side. Refuse rather than
-/// silently drop, so a future user of `sys_irq_control`'s pend flag gets an
-/// error to investigate instead of a lost interrupt.
+/// Pends interrupt `n` in software. Only the FROM_CPU sources can be:
+/// the PLIC's pending state is read-only for every other level input
+/// and its CLEAR register only clears edges. Anything else is refused
+/// rather than silently dropped, so a caller learns the source cannot
+/// be raised from software instead of losing an interrupt.
 pub fn pend_software_irq(
     InterruptNum(n): InterruptNum,
 ) -> Result<(), UsageError> {
     let _ = line_for_source(n)?;
-    Err(UsageError::NoIrq)
+    match from_cpu_reg(n) {
+        Some(reg) => {
+            reg.write(|w| w.cpu_intr().set_bit());
+            Ok(())
+        }
+        None => Err(UsageError::NoIrq),
+    }
 }
 
 /// Resets the kernel's core. Never returns.

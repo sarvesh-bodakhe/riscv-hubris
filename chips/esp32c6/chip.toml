@@ -12,3 +12,18 @@ granularity = 4
 address = 0x60000000
 size = 4096
 interrupts = { irq = 43 }
+
+# The interrupt-priority block carries the four software-raised
+# interrupt sources (FROM_CPU_INTR0..3, the chip module raises and clears
+# them); a task binds one to get a software interrupt of its own.
+#
+# The name says "from CPU" because on Espressif's dual-core parts these
+# are how one core interrupts the other. This chip has a single HP core
+# (SOC_CPU_CORES_NUM = 1), so there is no second CPU and no inter-core
+# anything here -- they are simply four interrupt sources whose input is
+# a register bit the CPU writes, which is what makes them usable as
+# software interrupts.
+[intpri]
+address = 0x600C5000
+size = 4096
+interrupts = { from-cpu0 = 22, from-cpu1 = 23, from-cpu2 = 24, from-cpu3 = 25 }
