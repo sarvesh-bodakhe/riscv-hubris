@@ -152,10 +152,19 @@ cfg_if::cfg_if! {
 // │ ┌──────────┐                                                                    │
 // └─┤ Humility ├────────────────────────────────────────────────────────────────────┘
 //   └──────────┘
+//
+// `#[used]` as well: these buffers exist for the debugger's sake, and
+// some of them have no reader in the task itself in some configurations
+// (HIFFY_DATA, without the `net` feature). Whether the optimizer keeps an
+// unreferenced exported static turns out to differ by target; the riscv32
+// builds dropped it, and Humility then found no data buffer to write.
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_TEXT: [u8; HIFFY_TEXT_SIZE] = [0; HIFFY_TEXT_SIZE];
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_DATA: [u8; HIFFY_DATA_SIZE] = [0; HIFFY_DATA_SIZE];
+#[used]
 #[unsafe(no_mangle)]
 pub static mut HIFFY_RSTACK: [u8; HIFFY_RSTACK_SIZE] = [0; HIFFY_RSTACK_SIZE];
 
