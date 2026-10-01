@@ -385,7 +385,9 @@ pub const fn compute_region_extension_data(
     } else {
         ((base >> 2) | ((size >> 3) - 1), 0b11) // A = NAPOT
     };
-    let mut pmpcfg: u32 = mode << 3; // L = 0 (never locked)
+    // L = 0: no region is locked by its encoding. The null region's slot
+    // is locked where the entries are written.
+    let mut pmpcfg: u32 = mode << 3;
     if r {
         pmpcfg |= 1 << 0;
     }
@@ -415,15 +417,30 @@ const _: () = assert!(
     "the riscv32 backend programs 8 or 16 PMP entries"
 );
 
+/// The PMP entry that holds the null region for every task, and the only
+/// one the kernel locks (see [`apply_memory_protection`]). The null
+/// region sorts to the bottom of every task's table.
+const NULL_GUARD_ENTRY: usize = 0;
+
+/// `pmpcfg` L: the entry applies to M-mode as well, and stays as written
+/// until reset.
+const PMPCFG_L: u32 = 1 << 7;
+
 /// Reprograms the PMP for `task`, called on every context switch.
 ///
 /// A task's regions map one-to-one onto PMP entries `0..PMP_ENTRIES`,
 /// precomputed at build time (see [`compute_region_extension_data`]).
-/// Entries are never locked (L=0), and unlocked PMP entries do not apply
-/// to M-mode at all -- so the kernel is unaffected by whatever is
-/// programmed here, and no enable/disable dance is needed around the
-/// update. U-mode is not running while we're in here, so transient states
-/// are unobservable.
+/// A task's grants are never locked (L=0), and unlocked PMP entries do
+/// not apply to M-mode at all -- so the kernel is unaffected by them, and
+/// no enable/disable dance is needed around the update. U-mode is not
+/// running while we're in here, so transient states are unobservable.
+///
+/// The one locked entry is the null region's ([`NULL_GUARD_ENTRY`]). A
+/// locked entry binds M-mode too, so the kernel faults on a read, a write
+/// or a jump through a null pointer instead of carrying on. The PMP has
+/// one set of permissions per entry for every mode, so this is stricter
+/// than the Cortex-M null region, which stops privileged code executing
+/// at address 0 but lets it read and write there.
 pub fn apply_memory_protection(task: &task::Task) {
     // Sized for the larger configuration; on an 8-entry core the upper
     // half stays zero and is never written.
@@ -435,10 +452,29 @@ pub fn apply_memory_protection(task: &task::Task) {
         pmpcfg[i / 4] |= (ext.pmpcfg & 0xFF) << ((i % 4) * 8);
     }
 
+    // Lock the null region's entry. A locked entry cannot be rewritten
+    // until reset, so the slot must hold the same thing for every task:
+    // the build gives every task the null region and sorts the table by
+    // base address, which puts it here (sys/kern/build.rs). The first
+    // call takes the lock; the hardware ignores the identical writes
+    // every later call makes. Locking any other slot would freeze one
+    // task's grant in place for all of them, hence the check.
+    let null = &task.region_table()[NULL_GUARD_ENTRY];
+    uassert!(
+        null.base == 0
+            && !null.attributes.intersects(
+                RegionAttributes::READ
+                    | RegionAttributes::WRITE
+                    | RegionAttributes::EXECUTE
+            )
+    );
+    pmpcfg[NULL_GUARD_ENTRY / 4] |= PMPCFG_L << ((NULL_GUARD_ENTRY % 4) * 8);
+
     // Safety: writing unlocked PMP entries has no effect on M-mode
     // execution; the worst a bad value can do is deny or grant U-mode
     // access, which is a correctness bug, not a memory-safety violation in
-    // the kernel.
+    // the kernel. The locked entry denies M-mode the null region only,
+    // which the kernel has no business touching.
     unsafe {
         core::arch::asm!("
             csrw pmpaddr0, {addr0}
