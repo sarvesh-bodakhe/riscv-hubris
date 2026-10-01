@@ -681,7 +681,11 @@ pub fn package(
     //
     // Regions a task may own: the protection entries the kernel programs
     // per task, less the null region every task carries.
-    let budget: usize = cfg.toml.regions_per_task() - 1;
+    // A riscv32 kernel spends one more entry on the guard below its own
+    // stack (kernel_stack_guard, below).
+    let reserved_entries: usize =
+        cfg.toml.target.starts_with("riscv32") as usize;
+    let budget: usize = cfg.toml.regions_per_task() - 1 - reserved_entries;
     let mut task_reqs = HashMap::new();
     for (t, sz) in task_sizes {
         let n = sz.len()
@@ -1657,6 +1661,7 @@ fn build_kernel(
         &allocs.kernel,
         cfg.toml.kernel_ram_region(),
         cfg.toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK),
+        kernel_stack_guard(&cfg.toml),
         &cfg.toml.all_regions("flash".to_string())?,
         &extern_regions,
         image_name,
@@ -2011,11 +2016,32 @@ fn append_task_sections(
     Ok(())
 }
 
+/// Size of the no-access guard the kernel keeps below its own stack, or
+/// zero on a target without one.
+///
+/// A riscv32 kernel covers it with a locked PMP entry, so a kernel stack
+/// overflow faults instead of writing into whatever lies below. (ARMv8-M
+/// has MSPLIM for this; a PMP entry is the nearest thing here.) The guard
+/// is as large as the stack, rounded up to the power of two a NAPOT entry
+/// needs: a frame has to be larger than the guard to step over it, and no
+/// kernel frame is as large as the whole stack.
+fn kernel_stack_guard(toml: &Config) -> u32 {
+    if toml.target.starts_with("riscv32") {
+        toml.kernel
+            .stacksize
+            .unwrap_or(DEFAULT_KERNEL_STACK)
+            .next_power_of_two()
+    } else {
+        0
+    }
+}
+
 fn generate_kernel_linker_script(
     name: &str,
     map: &BTreeMap<String, Range<u32>>,
     ram_section: &str,
     stacksize: u32,
+    stack_guard: u32,
     images: &IndexMap<String, Range<u32>>,
     extern_regions: &IndexMap<String, Range<u32>>,
     image_name: &str,
@@ -2026,6 +2052,7 @@ fn generate_kernel_linker_script(
 
     let mut stack_start = None;
     let mut stack_base = None;
+    let mut stack_guard_base = None;
 
     writeln!(linkscr, "MEMORY\n{{").unwrap();
     for (name, range) in map {
@@ -2041,6 +2068,17 @@ fn generate_kernel_linker_script(
                 // check this here and fail explicitly if it's unaligned.
                 bail!("specified kernel stack size is not 8-byte aligned");
             }
+
+            // The guard, if the chip has one, lies below the stack and
+            // belongs to no memory region: nothing is linked into it.
+            if stack_guard != 0 && start % stack_guard != 0 {
+                bail!(
+                    "kernel RAM at {start:#010x} is not aligned to the \
+                     {stack_guard:#x}-byte stack guard"
+                );
+            }
+            stack_guard_base = Some(start);
+            start += stack_guard;
 
             stack_base = Some(start);
             writeln!(
@@ -2073,6 +2111,16 @@ fn generate_kernel_linker_script(
         )?;
     }
     writeln!(linkscr, "__eheap = ORIGIN(RAM) + LENGTH(RAM);").unwrap();
+    // Only a target that guards its kernel stack gets the guard's symbol;
+    // the others keep the link script, and the symbol table, they had.
+    if stack_guard != 0 {
+        writeln!(
+            linkscr,
+            "_stack_guard_base = {:#010x};",
+            stack_guard_base.unwrap()
+        )
+        .unwrap();
+    }
     writeln!(linkscr, "_stack_base = {:#010x};", stack_base.unwrap()).unwrap();
     writeln!(linkscr, "_stack_start = {:#010x};", stack_start.unwrap())
         .unwrap();
