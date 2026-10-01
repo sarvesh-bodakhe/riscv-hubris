@@ -417,10 +417,22 @@ const _: () = assert!(
     "the riscv32 backend programs 8 or 16 PMP entries"
 );
 
-/// The PMP entry that holds the null region for every task, and the only
-/// one the kernel locks (see [`apply_memory_protection`]). The null
-/// region sorts to the bottom of every task's table.
-const NULL_GUARD_ENTRY: usize = 0;
+/// The PMP entry the kernel keeps for the guard below its own stack: a
+/// locked, no-access entry over `_stack_guard_base.._stack_base`, which
+/// the build reserves (xtask), so that a kernel stack overflow faults on
+/// its first store there instead of writing into whatever lies below.
+const STACK_GUARD_ENTRY: usize = 0;
+
+/// The PMP entry that holds the null region for every task, which the
+/// kernel locks (see [`apply_memory_protection`]). The null region sorts
+/// to the bottom of every task's table; the build caps tasks short of
+/// the full table, so padding nulls fill the entries below this one and
+/// give way to the kernel's own.
+const NULL_GUARD_ENTRY: usize = STACK_GUARD_ENTRY + 1;
+
+// Both of the kernel's locked entries are configured in `pmpcfg0`, which
+// `start_first_task` reads back.
+const _: () = assert!(NULL_GUARD_ENTRY < 4);
 
 /// `pmpcfg` L: the entry applies to M-mode as well, and stays as written
 /// until reset.
@@ -435,7 +447,8 @@ const PMPCFG_L: u32 = 1 << 7;
 /// no enable/disable dance is needed around the update. U-mode is not
 /// running while we're in here, so transient states are unobservable.
 ///
-/// The one locked entry is the null region's ([`NULL_GUARD_ENTRY`]). A
+/// Two entries are locked: the kernel's stack guard
+/// ([`STACK_GUARD_ENTRY`]) and the null region's ([`NULL_GUARD_ENTRY`]). A
 /// locked entry binds M-mode too, so the kernel faults on a read, a write
 /// or a jump through a null pointer instead of carrying on. The PMP has
 /// one set of permissions per entry for every mode, so this is stricter
@@ -470,11 +483,40 @@ pub fn apply_memory_protection(task: &task::Task) {
     );
     pmpcfg[NULL_GUARD_ENTRY / 4] |= PMPCFG_L << ((NULL_GUARD_ENTRY % 4) * 8);
 
+    // The guard below the kernel's own stack, in a spare entry of its
+    // own (a padding null: the build caps tasks one region short of the
+    // table). Locked, so it binds M-mode, and with no permissions: the
+    // stack grows down into it and the first store faults. As with the
+    // null region, the first call takes the lock and every later write
+    // is identical and ignored. `start_kernel` makes that first call,
+    // before the chip is initialised, so only the task-table set-up
+    // ahead of it runs unguarded.
+    {
+        unsafe extern "C" {
+            static _stack_guard_base: u8;
+            static _stack_base: u8;
+        }
+        let base = (&raw const _stack_guard_base) as u32;
+        let size = (&raw const _stack_base) as u32 - base;
+        let shift = (STACK_GUARD_ENTRY % 4) * 8;
+        let cfg = &mut pmpcfg[STACK_GUARD_ENTRY / 4];
+        uassert!((*cfg >> shift) & 0x07 == 0);
+        uassert!(
+            size.is_power_of_two()
+                && size >= chip::PMP_GRANULARITY.max(8)
+                && base.is_multiple_of(size)
+        );
+        pmpaddr[STACK_GUARD_ENTRY] = (base >> 2) | ((size >> 3) - 1);
+        // NAPOT, locked, no permissions.
+        *cfg = (*cfg & !(0xFF << shift)) | ((PMPCFG_L | (0b11 << 3)) << shift);
+    }
+
     // Safety: writing unlocked PMP entries has no effect on M-mode
     // execution; the worst a bad value can do is deny or grant U-mode
     // access, which is a correctness bug, not a memory-safety violation in
-    // the kernel. The locked entry denies M-mode the null region only,
-    // which the kernel has no business touching.
+    // the kernel. The locked entries deny M-mode the null region and the
+    // guard below its stack, neither of which the kernel has any business
+    // touching.
     unsafe {
         core::arch::asm!("
             csrw pmpaddr0, {addr0}
@@ -603,6 +645,19 @@ pub fn reinitialize(task: &mut task::Task) {
 /// (1 ms); the app supplies it, since the timer's input frequency is a
 /// board/clock configuration question.
 pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
+    // The first `apply_memory_protection`, in `start_kernel`, wrote the
+    // two locked entries. Check that they are there as written: locked,
+    // NAPOT, no permissions. A core need not implement the L bit, and a
+    // boot stage may hand over entries it has locked itself; either way
+    // the kernel would go on believing in a stack guard and a null guard
+    // that do not exist.
+    {
+        const LOCKED_NO_ACCESS: u32 = PMPCFG_L | (0b11 << 3);
+        let cfg0 = read_csr!("pmpcfg0");
+        uassert!((cfg0 >> (STACK_GUARD_ENTRY * 8)) & 0xFF == LOCKED_NO_ACCESS);
+        uassert!((cfg0 >> (NULL_GUARD_ENTRY * 8)) & 0xFF == LOCKED_NO_ACCESS);
+    }
+
     // Take ownership of the trap path before enabling anything that can
     // raise an interrupt. Two ordering rules, both learned the hard way:
     // interrupt sources must not be enabled while mtvec still points at

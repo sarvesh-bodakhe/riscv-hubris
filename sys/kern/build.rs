@@ -159,7 +159,45 @@ fn process_config() -> Result<Generated> {
             );
         }
 
-        if regions.len() > regions_per_task {
+        let riscv32 =
+            std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv32");
+
+        // On riscv32 the null region's PMP entry is locked and sits below
+        // every grant. A grant that reaches into the null region is
+        // shadowed by it for every mode, and one at address 0 would sort
+        // into the very slot the kernel locks, which it refuses to do at
+        // boot. Neither can work; say so here.
+        if riscv32 {
+            let null_end = region_table[&RegionKey::Null].size;
+            for &r in &regions[1..] {
+                let (key, region) = region_table.get_index(r).unwrap();
+                if region.base < null_end {
+                    let what = match key {
+                        RegionKey::Shared(name) => name,
+                        RegionKey::Owned { memory_name, .. } => memory_name,
+                        RegionKey::Null => unreachable!(),
+                    };
+                    bail!(
+                        "task {i}: {what} at {:#x} lies in the null \
+                         region (0..{null_end:#x}), which a riscv32 task \
+                         cannot be granted",
+                        region.base,
+                    );
+                }
+            }
+        }
+
+        // The kernel keeps PMP entries of its own, and tasks get that
+        // many fewer; the cap also guarantees a padding null for each,
+        // beside the task's own. They sort to the bottom, where the
+        // kernel overwrites them, and the task's null region stays in
+        // the slot above (STACK_GUARD_ENTRY, NULL_GUARD_ENTRY in the
+        // arch backend).
+        //
+        // Every riscv32 kernel spends one on the guard below its own
+        // stack.
+        let max_task_regions = regions_per_task - riscv32 as usize;
+        if regions.len() > max_task_regions {
             // Name them: which memory chunks and grants are being
             // counted is what someone reshaping an app.toml needs.
             let mut what = vec![];
@@ -168,7 +206,7 @@ fn process_config() -> Result<Generated> {
             }
             what.extend(task.shared_regions.iter().cloned());
             bail!(
-                "too many regions ({}) for task {i}, max {regions_per_task}: {}",
+                "too many regions ({}) for task {i}, max {max_task_regions}: {}",
                 regions.len(),
                 what.join(", ")
             );
