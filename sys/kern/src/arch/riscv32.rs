@@ -592,51 +592,51 @@ pub fn reinitialize(task: &mut task::Task) {
     task.save_mut().sp = initial_stack;
 
     // Paint the stack with a distinct pattern, for the benefit of stack
-    // usage measurement (humility stackmargin); same value as arm_m. Start
-    // from the region holding the stack's top word -- one word below the
-    // initial stack pointer; a zero stack pointer saturates to an address
-    // in no region, which skips the paint -- and paint from its base up to
-    // the stack pointer. There is no exception frame to leave room for.
-    if let Some((index, mut region)) = task
-        .region_table()
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, r)| r.contains((initial_stack as usize).saturating_sub(4)))
+    // usage measurement (humility stackmargin); same value as arm_m. Paint
+    // from the stack's floor up to the stack pointer; a stack in no region
+    // (a zero stack pointer, a corrupt table) skips the paint. There is no
+    // exception frame to leave room for.
+    //
+    // This is a diagnostic: if the slice does not fit, skip the paint
+    // rather than take the system down.
+    if let Some(floor) = stack_floor(task)
+        && let Some(len) = (initial_stack as usize).checked_sub(floor as usize)
+        && let Ok(mut uslice) =
+            USlice::<u32>::from_raw(floor as usize, len >> 2)
     {
-        // The stack may span several contiguous regions (the build chunks
-        // a non-power-of-two allocation); walk back through the sorted
-        // table to the first one.
-        let mut okay = true;
-        for prev in task.region_table()[..index].iter().rev() {
-            // A descriptor that overflows a u32 means a corrupt table.
-            let Some(prev_end) = prev.base.checked_add(prev.size) else {
-                okay = false;
-                break;
-            };
-            if prev_end != region.base {
-                break;
-            }
-            region = *prev;
-        }
-
-        // This is a diagnostic: if the slice does not fit, skip the paint
-        // rather than take the system down.
-        if okay
-            && let Some(len) =
-                (initial_stack as usize).checked_sub(region.base as usize)
-            && let Ok(mut uslice) =
-                USlice::<u32>::from_raw(region.base as usize, len >> 2)
-        {
-            // Unwrap rather than tolerate failure: try_write failing would
-            // mean the task's stack isn't writable by the task, which would
-            // bite us later anyway.
-            let zap = task.try_write(&mut uslice).unwrap_lite();
-            for word in zap.iter_mut() {
-                *word = 0xbaddcafe;
-            }
+        // Unwrap rather than tolerate failure: try_write failing would
+        // mean the task's stack isn't writable by the task, which would
+        // bite us later anyway.
+        let zap = task.try_write(&mut uslice).unwrap_lite();
+        for word in zap.iter_mut() {
+            *word = 0xbaddcafe;
         }
     }
+}
+
+/// The lowest address of `task`'s stack, or `None` if no region holds it.
+///
+/// Hubris places the stack at the low end of a task's RAM and grows it
+/// downward. The build chunks an allocation that is not a power of two,
+/// so the stack may span several contiguous regions: start from the one
+/// holding the stack's top word -- one word below the initial stack
+/// pointer; a zero stack pointer saturates to an address in no region --
+/// and walk back through the sorted table for as long as each region
+/// ends where the next begins. The base of the first is the floor.
+fn stack_floor(task: &task::Task) -> Option<u32> {
+    let top = (task.descriptor().initial_stack as usize).saturating_sub(4);
+    let table = task.region_table();
+    let index = table.iter().position(|r| r.contains(top))?;
+    let mut floor = table[index].base;
+    for prev in table[..index].iter().rev() {
+        // A descriptor that overflows a u32 means a corrupt table.
+        let prev_end = prev.base.checked_add(prev.size)?;
+        if prev_end != floor {
+            break;
+        }
+        floor = prev.base;
+    }
+    Some(floor)
 }
 
 /// Starts the kernel tick and the first task. Never returns.
@@ -1032,23 +1032,16 @@ unsafe extern "C" fn _hubris_trap_dispatch(task: *mut task::Task) {
     }
 }
 
-/// Whether `sp` has dropped below the RAM region that holds this task's
-/// stack -- the RISC-V signature of a stack overflow, which the ISA gives
-/// no dedicated trap for.
+/// Whether `sp` has dropped below this task's stack -- the RISC-V
+/// signature of a stack overflow, which the ISA gives no dedicated trap
+/// for.
 ///
-/// Hubris places the stack at the low end of a task's RAM region and grows
-/// it downward, so the stack's region is the one containing the initial
-/// stack pointer, and an `sp` below that region's base means the stack ran
-/// off the bottom and the faulting store landed outside the region. A
-/// stray pointer, by contrast, faults with `sp` still in range.
+/// An `sp` below the stack's floor (see [`stack_floor`]) means the stack
+/// ran off the bottom and the faulting store landed outside it. A stray
+/// pointer, by contrast, faults with `sp` still in range, however deep
+/// in the stack the task is.
 fn stack_overflowed(task: &task::Task, sp: u32) -> bool {
-    let initial = task.descriptor().initial_stack as usize;
-    for region in task.region_table().iter() {
-        if region.contains(initial.saturating_sub(4)) {
-            return sp < region.base;
-        }
-    }
-    false
+    stack_floor(task).is_some_and(|floor| sp < floor)
 }
 
 /// Delivers a fault taken in U-mode to the fault machinery, then picks a
