@@ -1591,6 +1591,11 @@ fn link_task(
     let task_toml = &cfg.toml.tasks[name];
 
     let extern_regions = cfg.toml.extern_regions_for(name, image_name)?;
+    check_stack_size(
+        &cfg.toml,
+        name,
+        task_toml.stacksize.or(cfg.toml.stacksize),
+    )?;
     generate_task_linker_script(
         "memory.x",
         &allocs.tasks[name],
@@ -1627,6 +1632,11 @@ fn link_dummy_task(
         .collect();
     let extern_regions = cfg.toml.extern_regions_for(name, image_name)?;
 
+    check_stack_size(
+        &cfg.toml,
+        name,
+        task_toml.stacksize.or(cfg.toml.stacksize),
+    )?;
     generate_task_linker_script(
         "memory.x",
         &memories, // ALL THE SPACE
@@ -1711,6 +1721,7 @@ fn build_kernel(
     allocs.hash(&mut image_id);
 
     let extern_regions = cfg.toml.kernel_extern_regions(image_name)?;
+    check_stack_size(&cfg.toml, "kernel", cfg.toml.kernel.stacksize)?;
     generate_kernel_linker_script(
         "memory.x",
         &allocs.kernel,
@@ -2068,6 +2079,31 @@ fn append_task_sections(
         writeln!(out, "}} INSERT AFTER .uninit")?;
     }
 
+    Ok(())
+}
+
+/// Refuses a stack size the target's calling convention cannot use.
+///
+/// The RISC-V psABI keeps the stack pointer 16-byte aligned, and a stack
+/// starts at the top of its allocation, so its size has to be a multiple
+/// of 16. The kernel asserts as much of every task's initial stack
+/// pointer; refusing the size here turns a kernel panic at boot into a
+/// build error. (The 8-byte check ARM needs is in the linker script
+/// generators.)
+fn check_stack_size(
+    toml: &Config,
+    what: &str,
+    stacksize: Option<u32>,
+) -> Result<()> {
+    if let Some(size) = stacksize
+        && toml.target.starts_with("riscv32")
+        && !size.is_multiple_of(16)
+    {
+        bail!(
+            "{what}: stack size {size} is not a multiple of 16, which the \
+             RISC-V calling convention requires"
+        );
+    }
     Ok(())
 }
 
