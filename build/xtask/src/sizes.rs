@@ -16,7 +16,9 @@ use indexmap::map::Entry;
 
 use crate::{
     Config,
-    dist::{Allocations, ContiguousRanges, DEFAULT_KERNEL_STACK},
+    dist::{
+        Allocations, ContiguousRanges, DEFAULT_KERNEL_STACK, kernel_stack_guard,
+    },
 };
 use build_stack::get_max_stack;
 
@@ -532,10 +534,13 @@ pub fn load_task_size<'a>(
 fn create_sizes(toml: &Config) -> Result<TaskSizes<'_>> {
     let mut sizes = IndexMap::new();
 
+    // The kernel's RAM holds its stack and, on a target that guards it,
+    // the guard below the stack; neither is in the ELF.
     let kernel_sizes = load_task_size(
         toml,
         "kernel",
-        toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK),
+        toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK)
+            + kernel_stack_guard(toml),
     )?;
     sizes.insert("kernel", kernel_sizes);
 

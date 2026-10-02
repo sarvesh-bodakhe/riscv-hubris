@@ -2116,7 +2116,7 @@ fn check_stack_size(
 /// is as large as the stack, rounded up to the power of two a NAPOT entry
 /// needs: a frame has to be larger than the guard to step over it, and no
 /// kernel frame is as large as the whole stack.
-fn kernel_stack_guard(toml: &Config) -> u32 {
+pub fn kernel_stack_guard(toml: &Config) -> u32 {
     if toml.target.starts_with("riscv32") {
         toml.kernel
             .stacksize
