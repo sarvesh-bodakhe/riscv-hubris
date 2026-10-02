@@ -1,6 +1,20 @@
-# esp32c6 devkit, minimal.
+# esp32c6 devkit, minimal. `xtask flash` goes through Humility and the
+# chip's built-in USB-Serial-JTAG, as it does through a probe on any
+# other board.
 
 # probe-rs knows the chip by this name; this section exists to put it
 # into the archive's flash.ron for debuggers.
 [probe-rs]
 chip-name = "esp32c6"
+
+# The boot ROM loads an image of its own format from flash and copies it
+# to where it runs; `xtask dist` wraps the linked image into one
+# (build/xtask/src/espimage.rs) and the archive carries it.
+[esp-image]
+# ESP_CHIP_ID_ESP32C6 in public esp-idf (esp_app_format.h).
+chip-id = 0x000D
+# Where this chip's boot ROM looks for a bootable image
+# (ESP_ROM_BOOTLOADER_OFFSET_FLASH in public esp-idf).
+boot-offset = 0x0
+flash-mode = "dio"
+flash-size = "4MB"

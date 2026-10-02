@@ -865,6 +865,9 @@ fn read_and_flatten_toml(
 pub struct BoardConfig {
     /// Info about how to interact with this board using probe-rs.
     pub probe_rs: Option<ProbeRsBoardConfig>,
+    /// How to wrap the image for this board's boot ROM, for parts whose
+    /// ROM loads an image of its own format from flash.
+    pub esp_image: Option<EspImageBoardConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -872,4 +875,54 @@ pub struct BoardConfig {
 pub struct ProbeRsBoardConfig {
     /// The "chip name" used by probe-rs for flashing.
     pub chip_name: String,
+}
+
+/// What an Espressif boot ROM needs to find in flash; see `espimage`.
+///
+/// The mode and size go into the image header, which is the only way the
+/// ROM learns how to read the rest of the image back. It has no way to
+/// negotiate, so a mode the flash will not honour does not fail the
+/// write -- it fails the next boot.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct EspImageBoardConfig {
+    /// The part's `esp_chip_id_t`, which the header names the image for.
+    pub chip_id: u16,
+    /// Flash offset the boot ROM loads its image from.
+    pub boot_offset: u32,
+    /// SPI mode the ROM should read the flash in.
+    pub flash_mode: EspFlashMode,
+    /// Size of the flash chip.
+    pub flash_size: EspFlashSize,
+}
+
+/// `esp_image_spi_mode_t`, by the names the vendor's tools use.
+#[derive(Copy, Clone, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EspFlashMode {
+    Qio = 0,
+    Qout = 1,
+    Dio = 2,
+    Dout = 3,
+}
+
+/// `esp_image_flash_size_t`, by the names the vendor's tools use.
+#[derive(Copy, Clone, Debug, Deserialize)]
+pub enum EspFlashSize {
+    #[serde(rename = "1MB")]
+    Mb1 = 0,
+    #[serde(rename = "2MB")]
+    Mb2 = 1,
+    #[serde(rename = "4MB")]
+    Mb4 = 2,
+    #[serde(rename = "8MB")]
+    Mb8 = 3,
+    #[serde(rename = "16MB")]
+    Mb16 = 4,
+    #[serde(rename = "32MB")]
+    Mb32 = 5,
+    #[serde(rename = "64MB")]
+    Mb64 = 6,
+    #[serde(rename = "128MB")]
+    Mb128 = 7,
 }

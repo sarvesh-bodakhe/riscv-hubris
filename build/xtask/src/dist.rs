@@ -1262,6 +1262,30 @@ fn build_archive(
         )?;
     }
 
+    // On a board whose boot ROM loads an image of its own format from
+    // flash, that is what gets written there; the flash configuration
+    // above names it.
+    if let Some(esp) = crate::flash::esp_image_config(&cfg.toml.board)? {
+        // The caboose and signing steps rewrite the image inside the
+        // finished archive, and would leave this copy of it behind.
+        if cfg.toml.caboose.is_some() || cfg.toml.signing.is_some() {
+            bail!(
+                "board {} wraps its image for the boot ROM, which is not \
+                 implemented for an image with a caboose or a signature",
+                cfg.toml.board,
+            );
+        }
+        archive.binary(
+            crate::flash::BOOT_IMAGE_ARCHIVE_PATH,
+            crate::espimage::build(
+                &esp,
+                raw_image.start_addr,
+                raw_image.kentry,
+                &raw_image.data,
+            ),
+        )?;
+    }
+
     let debug_dir = PathBuf::from("debug");
 
     if let Some(auxflash) = cfg.toml.auxflash.as_ref() {

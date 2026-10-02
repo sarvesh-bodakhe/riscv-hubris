@@ -8,6 +8,7 @@ pub mod auxflash;
 pub mod caboose_pos;
 pub mod config;
 pub mod dist;
+pub mod espimage;
 pub mod flash;
 pub mod gha_prepare_artifacts;
 pub mod graph;
