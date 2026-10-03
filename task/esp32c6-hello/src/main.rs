@@ -17,11 +17,18 @@
 //! out on the driver's behalf, checking every access against *this* task's
 //! regions. A driver cannot be tricked into reading memory its caller
 //! could not read itself.
+//!
+//! What happened to the victim is also recorded in a ring buffer in this
+//! task's RAM, the way upstream tasks keep their own trace, so the story
+//! can be read back through the debugger with `humility ringbuf`, with
+//! no serial cable attached.
 
 #![no_std]
 #![no_main]
 
 use drv_uart_api::Uart;
+#[cfg(feature = "demo-victim")]
+use ringbuf::{ringbuf, ringbuf_entry};
 #[cfg(feature = "demo-victim")]
 use task_esp32c6_demo_victim_api::Victim;
 use userlib::*;
@@ -31,6 +38,24 @@ use userlib::*;
 task_slot!(UART, uart_driver);
 #[cfg(feature = "demo-victim")]
 task_slot!(VICTIM, victim);
+
+/// What the victim did when asked. `Alive` carries the generation that
+/// answered, so the buffer shows it stepping as the supervisor restarts
+/// the task.
+#[cfg(feature = "demo-victim")]
+#[derive(Copy, Clone, PartialEq)]
+enum Trace {
+    None,
+    VictimAlive(u8),
+    VictimNotAnswering,
+    VictimPanicked,
+    VictimSurvivedPanic,
+    VictimForeignReadFaulted,
+    VictimForeignReadSucceeded,
+}
+
+#[cfg(feature = "demo-victim")]
+ringbuf!(Trace, 16, Trace::None);
 
 #[unsafe(export_name = "main")]
 fn main() -> ! {
@@ -60,39 +85,70 @@ fn main() -> ! {
 }
 
 /// A few ticks in, asks the victim task to do the two forbidden things
-/// and reports what happened. Each request is expected to kill the
-/// victim: the reply comes back as `ServerDeath`, the supervisor
-/// restarts it, and the next `alive` finds the new generation answering.
-/// If a request succeeds instead, that is printed too -- it would mean
-/// isolation is not enforced, which is the one thing worth shouting.
+/// and reports what happened, in the ring buffer and on the console.
+/// Each request is expected to kill the victim: the reply comes back as
+/// `ServerDeath`, the supervisor restarts it, and the next `alive` finds
+/// the new generation answering. If a request succeeds instead, that is
+/// reported too -- it would mean isolation is not enforced, which is the
+/// one thing worth shouting.
 #[cfg(feature = "demo-victim")]
 fn drive_victim(beat: u32) {
-    let victim = Victim::from(VICTIM.get_task_id());
-    match beat {
-        2 => write(match victim.alive(0xa5) {
-            Ok(0xa5) => b"[victim: alive]\r\n",
-            _ => b"[victim: NOT answering]\r\n",
-        }),
-        3 => write(match victim.panic_now() {
-            Err(_) => b"[victim: panicked; the supervisor restarted it]\r\n",
-            Ok(()) => b"[victim: survived a panic request (unexpected)]\r\n",
-        }),
-        4 => write(match victim.alive(0xa5) {
-            Ok(0xa5) => b"[victim: alive again, new generation]\r\n",
-            _ => b"[victim: NOT back after the panic]\r\n",
-        }),
+    // The slot lookup refreshes the generation, so after a restart this
+    // names the victim that is running now.
+    let id = VICTIM.get_task_id();
+    let generation = u8::from(id.generation());
+    let victim = Victim::from(id);
+    let (trace, text): (Trace, &[u8]) = match beat {
+        2 => match victim.alive(0xa5) {
+            Ok(0xa5) => (Trace::VictimAlive(generation), b"[victim: alive]\r\n"),
+            _ => (Trace::VictimNotAnswering, b"[victim: NOT answering]\r\n"),
+        },
+        3 => match victim.panic_now() {
+            Err(_) => (
+                Trace::VictimPanicked,
+                b"[victim: panicked; the supervisor restarted it]\r\n",
+            ),
+            Ok(()) => (
+                Trace::VictimSurvivedPanic,
+                b"[victim: survived a panic request (unexpected)]\r\n",
+            ),
+        },
+        4 => match victim.alive(0xa5) {
+            Ok(0xa5) => (
+                Trace::VictimAlive(generation),
+                b"[victim: alive again, new generation]\r\n",
+            ),
+            _ => (
+                Trace::VictimNotAnswering,
+                b"[victim: NOT back after the panic]\r\n",
+            ),
+        },
         // An address the victim holds no grant for: the start of the
         // peripheral space the kernel keeps to itself.
-        5 => write(match victim.read_foreign(0x0200_0000) {
-            Err(_) => b"[victim: foreign read faulted in hardware; restarted]\r\n",
-            Ok(_) => b"[victim: foreign read SUCCEEDED -- isolation not enforced]\r\n",
-        }),
-        6 => write(match victim.alive(0xa5) {
-            Ok(0xa5) => b"[victim: alive again after the fault]\r\n",
-            _ => b"[victim: NOT back after the fault]\r\n",
-        }),
-        _ => {}
-    }
+        5 => match victim.read_foreign(0x0200_0000) {
+            Err(_) => (
+                Trace::VictimForeignReadFaulted,
+                b"[victim: foreign read faulted in hardware; restarted]\r\n",
+            ),
+            Ok(_) => (
+                Trace::VictimForeignReadSucceeded,
+                b"[victim: foreign read SUCCEEDED -- isolation not enforced]\r\n",
+            ),
+        },
+        6 => match victim.alive(0xa5) {
+            Ok(0xa5) => (
+                Trace::VictimAlive(generation),
+                b"[victim: alive again after the fault]\r\n",
+            ),
+            _ => (
+                Trace::VictimNotAnswering,
+                b"[victim: NOT back after the fault]\r\n",
+            ),
+        },
+        _ => return,
+    };
+    ringbuf_entry!(trace);
+    write(text);
 }
 
 /// Sends `bytes` to the UART driver and panics if it refuses.

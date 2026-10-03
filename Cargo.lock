@@ -6420,6 +6420,7 @@ name = "task-esp32c6-hello"
 version = "0.1.0"
 dependencies = [
  "drv-uart-api",
+ "ringbuf",
  "task-esp32c6-demo-victim-api",
  "userlib",
 ]

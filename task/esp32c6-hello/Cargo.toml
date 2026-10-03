@@ -5,13 +5,14 @@ edition = "2024"
 
 [dependencies]
 drv-uart-api = { path = "../../drv/uart-api" }
+ringbuf = { path = "../../lib/ringbuf", optional = true }
 task-esp32c6-demo-victim-api = { path = "../../task/esp32c6-demo-victim-api", optional = true }
 userlib = { path = "../../sys/userlib" }
 
 [features]
 # Enabled by an app.toml whose image has a victim task: hello then asks
 # it to break itself, a few ticks in, and reports what happened.
-demo-victim = ["dep:task-esp32c6-demo-victim-api"]
+demo-victim = ["dep:task-esp32c6-demo-victim-api", "dep:ringbuf"]
 
 [[bin]]
 name = "task-esp32c6-hello"

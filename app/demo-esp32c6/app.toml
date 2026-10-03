@@ -1,5 +1,7 @@
 # ESP32-C6, minimal: the supervisor, the console driver, hello printing
 # through it over IPC, a victim task hello breaks on purpose, and idle.
+# What hello did to the victim is also in hello's ring buffer, readable
+# with `humility ringbuf` and no serial cable.
 # The image runs from SRAM. Nothing here uses the radio, and DMA is not
 # confined (see the chip module).
 
